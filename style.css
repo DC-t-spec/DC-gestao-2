@@ -559,3 +559,60 @@ body.is-mobile .grid.three{
   max-width: 560px;
   width: min(560px, 92vw);
 }
+/* ===== FIX DEFINITIVO: mobile drawer + overlay por ID (sem mexer no HTML) ===== */
+
+/* overlay funcionar mesmo que seja só id="overlay" */
+#overlay{
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.45);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .2s ease;
+  z-index: 9998;
+}
+
+/* garantir botão menu clicável no mobile */
+#sidebarToggle{
+  position: relative;
+  z-index: 10050;
+  pointer-events: auto;
+}
+
+@media (max-width: 860px){
+  /* ANULA a tua versão "barra inferior" e força drawer */
+  .sidebar{
+    top: 0 !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: auto !important;
+
+    width: 240px !important;
+    height: 100vh !important;
+    padding: 16px !important;
+
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+
+    transform: translateX(-105%) !important;
+    transition: transform .2s ease !important;
+    z-index: 9999 !important;
+
+    border-top: none !important;
+    border-right: 1px solid rgba(255,255,255,.12) !important;
+  }
+
+  body.menu-open .sidebar{
+    transform: translateX(0) !important;
+  }
+
+  body.menu-open #overlay{
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  /* main não ficar por baixo */
+  .main{
+    padding: 12px 12px 18px !important;
+  }
+}
