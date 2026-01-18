@@ -1,4 +1,5 @@
-const CACHE = "dc-gestao-v1";
+const CACHE = "dc-gestao-beta-009";
+
 
 const ASSETS = [
   "./",
