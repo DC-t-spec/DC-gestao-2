@@ -1,2341 +1,3450 @@
-/***********************
- * Gestão Fácil - V1 (JS COMPLETO ORGANIZADO)
- * Offline + Online (Supabase opcional)
- * + Auto-backup (local snapshots)
- * + Auth (PIN + níveis)
- * + Permissões (admin / manager / staff)
- * + Gestão de Utilizadores (Admin) na Config
- * + Logout (top) seguro
- * + Menu responsivo (drawer mobile + colapsar sidebar desktop)
- * + Recuperação de PIN (Pergunta/Resposta) + Reset Admin + MustChangePin
- *
- * ✅ Mantém estrutura atual
- * ✅ Acrescentado: Stock Base (stockBaseId + stockFactor) para pacotes consumirem GB
- * ✅ Removido conflito: funções duplicadas de stock (havia 2–3 versões a pisarem-se)
- ************************/
+alert("JS carregado ✅ Gestão Fácil - V1 (BASE + Sales + Inventory + Audit + Snapshots)");
 
-/* =======================
-   Utils
-======================= */
-const MT = (n) => `${Number(n || 0).toFixed(2)} MT`;
-const todayISO = () => new Date().toISOString().slice(0, 10);
-const uid = () =>
-  crypto?.randomUUID
-    ? crypto.randomUUID()
-    : Math.random().toString(16).slice(2) + Date.now().toString(16);
-const byName = (a, b) => (a.nome || "").localeCompare(b.nome || "");
+(() => {
+  "use strict";
 
-/* =======================
-   Storage
-======================= */
-const KEY = "gestao_facil_v1_offlinefirst";
-const BACKUP_KEY = "gestao_facil_auto_snapshots_v1";
-const BACKUP_MAX = 30;
 
-const loadLocal = () => {
-  try {
-    return JSON.parse(localStorage.getItem(KEY)) || null;
-  } catch {
-    return null;
+  /***********************
+   * Offline-first (localStorage)
+   * Workspace + Login (PIN)
+   * Produtos + Clientes + Contas/Ledger + Compras
+   * POS ligado ao Financeiro (ledger IN)
+   * Stock: Inventário (ajustes + histórico)
+   * Stock: Vendas (histórico + cancelar/estornar)
+   * Auditoria append-only
+   * Supabase snapshots (restore + manual backup + auto)
+   * Export/Import JSON
+   ***********************/var _db$online11, _db$settings6;
+
+  function escapeHTML(s) {
+    return String(s !== null && s !== void 0 ? s : "").
+    replace(/&/g, "&amp;").
+    replace(/</g, "&lt;").
+    replace(/>/g, "&gt;").
+    replace(/"/g, "&quot;").
+    replace(/'/g, "&#39;");
   }
-};
-const saveLocal = (db) => localStorage.setItem(KEY, JSON.stringify(db));
 
-/* =======================
-   DB init
-======================= */
-let db =
-  loadLocal() || {
-    meta: { updatedAt: Date.now(), version: 1 },
-    online: { url: "", key: "" },
+  /* =======================
+     Keys + Utils
+  ======================= */
+  const WS_KEY = "gf_ws";
+  const DB_KEY = "gf_db";
+  const SESSION_KEY = "gf_session";
 
+  const uid = () =>
+  window.crypto && crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random());
+
+  const nowISO = () => new Date().toISOString();
+  const todayISO = () => new Date().toISOString().slice(0, 10);
+  const MT = n => `${Number(n || 0).toFixed(2)} MT`;
+
+  const load = (k, fallback) => {
+    try {
+      const raw = localStorage.getItem(k);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+  const el = id => document.getElementById(id);
+  // ===== Auditoria UI =====
+  const auditFrom = el("auditFrom");
+  const auditTo = el("auditTo");
+  const auditAction = el("auditAction");
+  const auditUser = el("auditUser");
+  const btnAuditFilter = el("btnAuditFilter");
+  const btnAuditRefresh = el("btnAuditRefresh");
+  const auditTable = el("auditTable");
+  const auditCount = el("auditCount");
+  const auditMsg = el("auditMsg");
+
+  function nnum(v, def = 0) {
+    const x = Number(String(v !== null && v !== void 0 ? v : "").replace(",", "."));
+    return Number.isFinite(x) ? x : def;
+  }
+  let workspaceId = localStorage.getItem(WS_KEY) || "";
+  let session = load(SESSION_KEY, null) || null;
+
+
+  /* =======================
+     DB
+  ======================= */
+  const emptyDB = () => ({
+    meta: { version: "1.2", createdAt: nowISO(), updatedAt: nowISO() },
     users: [],
-    auth: { currentUserId: null },
-
-    // DATA
-    accounts: [{ id: uid(), nome: "Dinheiro", tipo: "Dinheiro", ativo: true, saldo: 0 }],
-    customers: [{ id: uid(), nome: "Cliente balcão", telefone: "", notas: "" }],
-    products: [
-      { id: uid(), nome: "Refresco 500ml", precoVenda: 35, precoAquisicaoRef: 22, minStock: 5, img: "", desc: "", ativo: true, stockBaseId: "", stockFactor: 1 },
-      { id: uid(), nome: "Bolo fatia", precoVenda: 50, precoAquisicaoRef: 30, minStock: 3, img: "", desc: "", ativo: true, stockBaseId: "", stockFactor: 1 },
-    ],
-    inventory: {},
-
-    purchases: [],
+    products: [],
+    clients: [],
+    accounts: [],
     sales: [],
+    purchases: [],
     ledger: [],
+    inventory: [],
+    audit: [],
+    settings: {
+      autoSnapshots: true,
+      snapshotRetention: 30 },
 
-    // SETTINGS
-    settings: { autoBackupMinutes: 10 },
-  };
+    online: { enabled: false, url: "", key: "" } });
 
-saveLocal(db);
 
-/* =======================
-   Runtime state
-======================= */
-let cart = [];
-let supabase = null;
 
-/* =======================
-   DOM helpers
-======================= */
-function setSyncState(text) {
-  const el = document.getElementById("syncState");
-  if (el) el.textContent = text;
-}
-function setAppLocked(locked) {
-  const app = document.querySelector(".app");
-  if (app) app.style.display = locked ? "none" : "flex";
-}
+  let db = load(DB_KEY, emptyDB());
+  db = normalizeDB(db);
+  save(DB_KEY, db); // garante base consistente já no arranque
+  db = ensureAllUpdatedAt(db);
+  save(DB_KEY, db);
+  session = load(SESSION_KEY, null) || null;
 
-/* =======================
-   Online (Supabase opcional)
-======================= */
-function loadScriptOnce(src, id) {
-  return new Promise((resolve, reject) => {
-    if (document.getElementById(id)) return resolve();
-    const s = document.createElement("script");
-    s.src = src;
-    s.id = id;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error("Falha ao carregar script"));
-    document.head.appendChild(s);
-  });
-}
 
-async function initSupabaseIfConfigured() {
-  const { url, key } = db.online || {};
-  if (!url || !key) {
-    setSyncState("Modo: Offline");
-    supabase = null;
-    return;
-  }
-  await loadScriptOnce(
-    "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js",
-    "supabase-cdn"
-  );
-  supabase = window.supabase.createClient(url, key);
-  setSyncState("Modo: Online (Supabase)");
-}
 
-function getDeviceId() {
-  const k = "gestao_facil_device_id";
-  let v = localStorage.getItem(k);
-  if (!v) {
-    v = uid();
-    localStorage.setItem(k, v);
-  }
-  return v;
-}
+  function normalizeDB(db) {
+    const base = emptyDB();
 
-async function syncNow() {
-  if (!supabase) {
-    alert("Online não está configurado. Vá em Config e cole SUPABASE_URL e KEY (ou use offline).");
-    return;
-  }
+    db = db && typeof db === "object" ? db : {};
 
-  setSyncState("Sincronizando...");
-  const deviceId = getDeviceId();
-  const payload = { device_id: deviceId, data: db, updated_at: new Date().toISOString() };
+    // coleções
+    db.users = Array.isArray(db.users) ? db.users : [];
+    db.products = Array.isArray(db.products) ? db.products : [];
+    db.clients = Array.isArray(db.clients) ? db.clients : [];
+    db.accounts = Array.isArray(db.accounts) ? db.accounts : [];
+    db.sales = Array.isArray(db.sales) ? db.sales : [];
+    db.purchases = Array.isArray(db.purchases) ? db.purchases : [];
+    db.ledger = Array.isArray(db.ledger) ? db.ledger : [];
+    db.inventory = Array.isArray(db.inventory) ? db.inventory : [];
+    db.audit = Array.isArray(db.audit) ? db.audit : [];
 
-  const { error } = await supabase.from("snapshots").upsert(payload, { onConflict: "device_id" });
-  if (error) {
-    console.error(error);
-    setSyncState("Online (erro)");
-    alert("Não consegui sincronizar. Verifique a tabela 'snapshots' no Supabase.");
-    return;
-  }
-
-  const { data, error: e2 } = await supabase
-    .from("snapshots")
-    .select("*")
-    .eq("device_id", deviceId)
-    .single();
-
-  if (e2) {
-    console.error(e2);
-    setSyncState("Online (erro)");
-    alert("Sincronizei, mas não consegui ler de volta.");
-    return;
-  }
-
-  db = data.data;
-  saveLocal(db);
-  setSyncState("Online (ok)");
-  renderAll();
-}
-
-/* =======================
-   Modal
-======================= */
-function openModal(title, html) {
-  const modal = document.getElementById("modal");
-  const modalTitle = document.getElementById("modalTitle");
-  const modalBody = document.getElementById("modalBody");
-  if (modalTitle) modalTitle.textContent = title;
-  if (modalBody) modalBody.innerHTML = html;
-  if (modal) modal.style.display = "flex";
-}
-function closeModal() {
-  const modal = document.getElementById("modal");
-  const modalBody = document.getElementById("modalBody");
-  if (modal) modal.style.display = "none";
-  if (modalBody) modalBody.innerHTML = "";
-}
-
-/* =======================
-   Core helpers
-======================= */
-function invQty(productId) {
-  return Number(db.inventory?.[productId] || 0);
-}
-function setInv(productId, qty) {
-  if (!db.inventory) db.inventory = {};
-  db.inventory[productId] = Number(qty || 0);
-}
-function accountName(id) {
-  return db.accounts.find((a) => a.id === id)?.nome || "—";
-}
-function customerName(id) {
-  return db.customers.find((c) => c.id === id)?.nome || "—";
-}
-function productById(id) {
-  return db.products.find((p) => p.id === id);
-}
-
-/* =======================
-   ✅ STOCK BASE (PACOTES)
-   - Usa stockBaseId + stockFactor
-   - Pacote consome do stock do produto base (ex: GB)
-======================= */
-function isGbBaseProduct(p) {
-  return !!p && (p.nome || "").trim().toUpperCase() === "GB" && (!p.stockBaseId || !String(p.stockBaseId).trim());
-}
-
-function baseIdForProduct(productId) {
-  const p = productById(productId);
-  if (!p) return null;
-  const base = (p.stockBaseId && String(p.stockBaseId).trim()) ? p.stockBaseId : p.id;
-  return base;
-}
-
-function factorForProduct(productId) {
-  const p = productById(productId);
-  if (!p) return 1;
-  const f = Number(p.stockFactor || 1);
-  return (Number.isFinite(f) && f > 0) ? f : 1;
-}
-
-// quanto consome do stock base por 1 unidade vendida
-function consumptionQty(productId) {
-  return factorForProduct(productId);
-}
-
-// stock vendável (pacote = floor(stockBase / factor))
-function stockForProduct(productId) {
-  const baseId = baseIdForProduct(productId);
-  if (!baseId) return 0;
-  const baseStock = invQty(baseId);
-  const factor = factorForProduct(productId);
-  return factor > 0 ? Math.floor(baseStock / factor) : 0;
-}
-
-// baixar stock no base ao finalizar venda
-function consumeStockForSaleItem(productId, qtyUnits) {
-  const baseId = baseIdForProduct(productId);
-  if (!baseId) throw new Error("Stock base não encontrado.");
-  const factor = factorForProduct(productId);
-  const need = Number(qtyUnits || 0) * factor;
-
-  const current = invQty(baseId);
-  if (need > current) throw new Error("Stock insuficiente (base).");
-
-  setInv(baseId, current - need);
-}
-
-// custo unitário (pacote = factor * custo do base)
-function costUnitFor(productId) {
-  const p = productById(productId);
-  if (!p) return 0;
-
-  const baseId = baseIdForProduct(productId);
-  if (!baseId) return Number(p.precoAquisicaoRef || 0);
-
-  // se tem base diferente, usa custo do base
-  if (baseId !== p.id) {
-    const base = productById(baseId);
-    const baseCost = Number(base?.precoAquisicaoRef || 0);
-    return factorForProduct(productId) * baseCost;
-  }
-
-  // normal
-  return Number(p.precoAquisicaoRef || 0);
-}
-
-function addLedger({ date, type, accountId, amount, refType, refId, note }) {
-  db.ledger.push({
-    id: uid(),
-    date,
-    type,
-    accountId,
-    amount: Number(amount || 0),
-    refType,
-    refId,
-    note: note || "",
-  });
-}
-
-function calcAccountBalance(accountId) {
-  const base = Number(db.accounts.find((a) => a.id === accountId)?.saldo || 0);
-  const ins = db.ledger
-    .filter((x) => x.accountId === accountId && x.type === "in")
-    .reduce((s, x) => s + Number(x.amount), 0);
-  const outs = db.ledger
-    .filter((x) => x.accountId === accountId && x.type === "out")
-    .reduce((s, x) => s + Number(x.amount), 0);
-  return base + ins - outs;
-}
-
-/* =======================
-   Auto-backup
-======================= */
-function saveAutoSnapshot() {
-  try {
-    const list = JSON.parse(localStorage.getItem(BACKUP_KEY) || "[]");
-    list.push({ at: Date.now(), db: JSON.parse(JSON.stringify(db)) });
-    while (list.length > BACKUP_MAX) list.shift();
-    localStorage.setItem(BACKUP_KEY, JSON.stringify(list));
-  } catch (err) {
-    console.warn("Auto-backup falhou:", err);
-  }
-}
-function getAutoSnapshots() {
-  try {
-    return JSON.parse(localStorage.getItem(BACKUP_KEY) || "[]");
-  } catch {
-    return [];
-  }
-}
-function restoreAutoSnapshotByIndexFromEnd(indexFromEnd = 0) {
-  const list = getAutoSnapshots();
-  const snap = list[list.length - 1 - indexFromEnd];
-  if (!snap) return alert("Sem snapshots disponíveis.");
-  if (!confirm("Restaurar este snapshot automático?")) return;
-  db = snap.db;
-  saveLocal(db);
-  renderAll();
-  alert("Snapshot restaurado!");
-}
-function updateBackupStatusUI() {
-  const el = document.getElementById("autoBackupStatus");
-  if (!el) return;
-  const snaps = getAutoSnapshots();
-  const last = snaps.length ? new Date(snaps[snaps.length - 1].at).toLocaleString() : "—";
-  el.textContent = `Auto-backup ativo • último: ${last} • guardados: ${snaps.length}/${BACKUP_MAX}`;
-}
-
-/* =======================
-   touch() (única fonte de gravação)
-======================= */
-function touch() {
-  db.meta.updatedAt = Date.now();
-  saveLocal(db);
-  saveAutoSnapshot();
-  updateBackupStatusUI();
-}
-
-/* =======================
-   AUTH (PIN + roles)
-======================= */
-function ensureAuthModel() {
-  db.users = db.users || [];
-  db.auth = db.auth || { currentUserId: null };
-  saveLocal(db);
-}
-
-function currentUser() {
-  const id = db.auth?.currentUserId;
-  return db.users.find((u) => u.id === id) || null;
-}
-function isLoggedIn() {
-  const u = currentUser();
-  return !!u && u.ativo !== false;
-}
-function isAdmin() {
-  const u = currentUser();
-  return !!u && u.role === "admin";
-}
-
-function setLoggedInUser(userId) {
-  db.auth.currentUserId = userId;
-  touch();
-}
-
-function createUser({ nome, pin, role }) {
-  const cleanName = (nome || "").trim();
-  const cleanPin = (pin || "").trim();
-
-  if (!cleanName) throw new Error("Nome obrigatório");
-  if (!/^\d{4,8}$/.test(cleanPin)) throw new Error("PIN deve ter 4–8 dígitos");
-
-  const exists = db.users.some((u) => u.nome.toLowerCase() === cleanName.toLowerCase());
-  if (exists) throw new Error("Já existe um utilizador com esse nome");
-
-  const user = {
-    id: uid(),
-    nome: cleanName,
-    pin: cleanPin,
-    role,
-    ativo: true,
-    createdAt: Date.now(),
-    securityQuestion: "",
-    securityAnswerHash: "",
-    mustChangePin: false,
-  };
-
-  db.users.push(user);
-  touch();
-  return user;
-}
-
-function login(nome, pin) {
-  const cleanName = (nome || "").trim();
-  const cleanPin = (pin || "").trim();
-  const u = db.users.find((x) => x.ativo !== false && x.nome === cleanName && x.pin === cleanPin);
-  if (!u) return { ok: false };
-
-  setLoggedInUser(u.id);
-  return { ok: true, mustChangePin: !!u.mustChangePin };
-}
-
-/* =======================
-   RECUPERAÇÃO PIN (A + B)
-======================= */
-function normalizeAnswer(s) {
-  return (s || "").trim().toLowerCase();
-}
-
-async function sha256(text) {
-  const enc = new TextEncoder().encode(text);
-  const buf = await crypto.subtle.digest("SHA-256", enc);
-  return Array.from(new Uint8Array(buf))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-async function setSecurityQA(userId, question, answerPlain) {
-  ensureAuthModel();
-  const q = (question || "").trim();
-  const a = normalizeAnswer(answerPlain);
-
-  if (!q) throw new Error("Pergunta obrigatória");
-  if (a.length < 2) throw new Error("Resposta muito curta");
-
-  const hash = await sha256(a);
-
-  db.users = db.users.map((u) =>
-    u.id !== userId ? u : { ...u, securityQuestion: q, securityAnswerHash: hash }
-  );
-
-  touch();
-}
-
-async function verifySecurityAnswer(userId, answerPlain) {
-  const u = db.users.find((x) => x.id === userId);
-  if (!u || !u.securityAnswerHash) return false;
-  const hash = await sha256(normalizeAnswer(answerPlain));
-  return hash === u.securityAnswerHash;
-}
-
-function adminResetPin(userId, tempPin) {
-  if (!isAdmin()) return alert("Só ADMIN pode resetar PIN.");
-  if (!/^\d{4,8}$/.test(String(tempPin || "").trim()))
-    return alert("PIN temporário deve ter 4–8 dígitos.");
-
-  const me = currentUser();
-  if (me && me.id === userId) return alert("Use 'Alterar meu PIN' para você mesmo.");
-
-  db.users = db.users.map((u) =>
-    u.id !== userId ? u : { ...u, pin: String(tempPin).trim(), mustChangePin: true, ativo: true }
-  );
-
-  touch();
-}
-
-function changeMyPin(oldPin, newPin) {
-  const u = currentUser();
-  if (!u) return alert("Sem sessão.");
-  if (String(oldPin || "").trim() !== u.pin) return alert("PIN atual incorreto.");
-  if (!/^\d{4,8}$/.test(String(newPin || "").trim()))
-    return alert("Novo PIN deve ter 4–8 dígitos.");
-
-  db.users = db.users.map((x) =>
-    x.id !== u.id ? x : { ...x, pin: String(newPin).trim(), mustChangePin: false }
-  );
-
-  setLoggedInUser(u.id);
-  touch();
-  alert("PIN alterado!");
-}
-
-async function recoverPinByQuestion(userId, answerPlain, newPin) {
-  ensureAuthModel();
-  const u = db.users.find((x) => x.id === userId);
-  if (!u) return alert("Utilizador não encontrado.");
-  if (u.ativo === false) return alert("Utilizador inativo.");
-  if (!u.securityQuestion || !u.securityAnswerHash)
-    return alert("Este utilizador não tem pergunta de segurança definida.");
-
-  const ok = await verifySecurityAnswer(userId, answerPlain);
-  if (!ok) return alert("Resposta incorreta.");
-
-  if (!/^\d{4,8}$/.test(String(newPin || "").trim()))
-    return alert("Novo PIN deve ter 4–8 dígitos.");
-
-  db.users = db.users.map((x) =>
-    x.id !== userId ? x : { ...x, pin: String(newPin).trim(), mustChangePin: false }
-  );
-
-  touch();
-  alert("PIN atualizado! Agora já pode iniciar sessão.");
-}
-
-/* =======================
-   Permissões (guard)
-======================= */
-function role() {
-  return currentUser()?.role || null;
-}
-function can(action) {
-  const r = role();
-  if (!r) return false;
-
-  const rules = {
-    "users.manage": ["admin"],
-    "system.reset": ["admin"],
-    "accounts.delete": ["admin"],
-    "products.delete": ["admin"],
-
-    "accounts.create_edit": ["admin", "manager"],
-    "products.create": ["admin", "manager"],
-    "sales.create": ["admin", "manager", "staff"],
-    "purchases.create": ["admin", "manager", "staff"],
-  };
-
-  const allowed = rules[action] || ["admin"];
-  return allowed.includes(r);
-}
-function guard(action, msg) {
-  if (can(action)) return true;
-  alert(msg || "Sem permissão para esta ação.");
-  return false;
-}
-
-/* =======================
-   Auth UI
-======================= */
-function showAuthScreen(mode) {
-  const auth = document.getElementById("authScreen");
-  const loginBox = document.getElementById("authModeLogin");
-  const regBox = document.getElementById("authModeRegister");
-  if (!auth || !loginBox || !regBox) return;
-
-  auth.style.display = "flex";
-  loginBox.style.display = mode === "login" ? "block" : "none";
-  regBox.style.display = mode === "register" ? "block" : "none";
-}
-function hideAuthScreen() {
-  const auth = document.getElementById("authScreen");
-  if (auth) auth.style.display = "none";
-}
-function refreshLoginUsers() {
-  const sel = document.getElementById("loginUser");
-  const hint = document.getElementById("loginHint");
-  if (!sel) return;
-
-  const active = db.users.filter((u) => u.ativo !== false);
-  sel.innerHTML = active.map((u) => `<option value="${u.nome}">${u.nome} (${u.role})</option>`).join("");
-  if (hint) hint.textContent = active.length ? "" : "Sem utilizadores. Crie o primeiro Admin.";
-}
-function setRegisterCopy() {
-  const title = document.getElementById("registerTitle");
-  const roleWrap = document.getElementById("roleWrap");
-  const hasUsers = db.users.length > 0;
-
-  if (!hasUsers) {
-    if (title) title.textContent = "Primeiro acesso: crie o utilizador Admin.";
-    if (roleWrap) roleWrap.style.display = "none";
-  } else {
-    if (title) title.textContent = "Criar novo utilizador (Admin necessário para ações críticas).";
-    if (roleWrap) roleWrap.style.display = "block";
-  }
-}
-function bootAuthGate() {
-  ensureAuthModel();
-
-  if (db.users.length === 0) {
-    setAppLocked(true);
-    setRegisterCopy();
-    showAuthScreen("register");
-    return;
-  }
-
-  if (isLoggedIn()) {
-    setAppLocked(false);
-    hideAuthScreen();
-    return;
-  }
-
-  setAppLocked(true);
-  refreshLoginUsers();
-  showAuthScreen("login");
-}
-
-/* ✅ Logout (único, oficial) */
-function doLogout() {
-  ensureAuthModel();
-  db.auth.currentUserId = null;
-  touch();
-
-  setAppLocked(true);
-  refreshLoginUsers();
-  showAuthScreen("login");
-}
-
-/* =======================
-   Navigation
-======================= */
-const pages = {
-  home: { title: "Home", desc: "Dashboard geral + contas de pagamento" },
-  vendas: { title: "Vendas", desc: "Catálogo + carrinho + cliente + conta" },
-  compras: { title: "Compras", desc: "Compras a fornecedores (entra no armazém)" },
-  clientes: { title: "Clientes", desc: "Cadastro de clientes" },
-  produtos: { title: "Produtos", desc: "Cadastro de produtos + lucro esperado" },
-  armazem: { title: "Armazém", desc: "Stock em tempo real + alertas" },
-  relatorios: { title: "Relatórios", desc: "Base de relatórios (V1)" },
-  fiscal: { title: "Fiscal", desc: "Página em desenvolvimento" },
-  config: { title: "Config", desc: "Backup + Online (Supabase)" },
-  suporte: { title: "Suporte", desc: "FAQ + reportar problemas" },
-};
-
-function go(page) {
-  document.querySelectorAll(".mitem").forEach((b) => b.classList.toggle("active", b.dataset.page === page));
-  document.querySelectorAll(".page").forEach((p) => p.classList.toggle("active", p.id === page));
-
-  const t = document.getElementById("pageTitle");
-  const d = document.getElementById("pageDesc");
-  if (t) t.textContent = pages[page]?.title || page;
-  if (d) d.textContent = pages[page]?.desc || "";
-
-  const quick = document.getElementById("btnQuickSale");
-  if (quick) quick.style.display = page === "vendas" ? "none" : "inline-flex";
-
-  renderAll();
-}
-
-/* =======================
-   HOME
-======================= */
-function renderHome() {
-  const d = todayISO();
-  const salesToday = db.sales.filter((s) => s.data === d);
-  const buysToday = db.purchases.filter((p) => p.data === d);
-
-  const totalSales = salesToday.reduce((s, x) => s + Number(x.total), 0);
-  const totalBuys = buysToday.reduce((s, x) => s + Number(x.total), 0);
-  const totalProfit = salesToday.reduce((s, x) => s + Number(x.profit), 0);
-
-  const k1 = document.getElementById("kpiSalesToday");
-  const k2 = document.getElementById("kpiSalesTodayCount");
-  const k3 = document.getElementById("kpiBuysToday");
-  const k4 = document.getElementById("kpiBuysTodayCount");
-  const k5 = document.getElementById("kpiProfitToday");
-
-  if (k1) k1.textContent = MT(totalSales);
-  if (k2) k2.textContent = `${salesToday.length} vendas`;
-  if (k3) k3.textContent = MT(totalBuys);
-  if (k4) k4.textContent = `${buysToday.length} compras`;
-  if (k5) k5.textContent = MT(totalProfit);
-
-  const elAcc = document.getElementById("accountsList");
-  if (elAcc) {
-    const accs = [...db.accounts].sort(byName);
-    elAcc.innerHTML = accs.length
-      ? accs
-          .map((a) => {
-            const saldo = calcAccountBalance(a.id);
-            return `
-              <div class="item">
-                <h4>${a.nome} <span class="badge">${a.tipo}</span></h4>
-                <div class="meta">
-                  <span>Saldo: <strong>${MT(saldo)}</strong></span>
-                  <span>${a.ativo ? "Ativa" : "Inativa"}</span>
-                </div>
-                <div class="actions">
-                  <button class="btn ghost" data-edit-acc="${a.id}">Editar</button>
-                  <button class="btn danger" data-del-acc="${a.id}">Apagar</button>
-                </div>
-              </div>`;
-          })
-          .join("")
-      : `<div class="muted">Sem contas.</div>`;
-  }
-
-  const elLow = document.getElementById("lowStockList");
-  if (elLow) {
-    const lows = db.products
-      .filter((p) => p.ativo)
-.map((p) => ({ p, qty: stockForProduct(p.id) }))
-      .filter((x) => x.p.minStock > 0 && x.qty <= x.p.minStock)
-      .sort((a, b) => a.qty - b.qty);
-
-    elLow.innerHTML = lows.length
-      ? lows
-          .map(
-            (x) => `
-            <div class="item">
-              <h4>${x.p.nome}</h4>
-              <div class="meta">
-                <span>Stock: <strong>${x.qty}</strong></span>
-                <span>Mínimo: ${x.p.minStock}</span>
-              </div>
-            </div>`
-          )
-          .join("")
-      : `<div class="muted">Sem alertas de stock mínimo.</div>`;
-  }
-
-  const elLast = document.getElementById("lastSales");
-  if (elLast) {
-    const last = [...db.sales].slice(-5).reverse();
-    elLast.innerHTML = last.length
-      ? last
-          .map(
-            (s) => `
-            <div class="item">
-              <h4>${MT(s.total)} <span class="badge">${s.data}</span></h4>
-              <div class="meta">
-                <span>Cliente: ${customerName(s.customerId)}</span>
-                <span>Conta: ${accountName(s.accountId)}</span>
-                <span>${s.items.length} itens</span>
-              </div>
-            </div>`
-          )
-          .join("")
-      : `<div class="muted">Ainda sem vendas.</div>`;
-  }
-}
-
-/* =======================
-   Accounts (modal + delete)
-======================= */
-function modalAccount(id = null) {
-  if (!guard("accounts.create_edit", "Apenas Admin/Gestão podem criar/editar contas.")) return;
-
-  const a = id ? db.accounts.find((x) => x.id === id) : null;
-
-  openModal(
-    id ? "Editar conta" : "Nova conta",
-    `
-      <form id="accForm" class="form2" ${id ? `data-edit-id="${id}"` : ""}>
-        <div class="field full">
-          <label>Nome</label>
-          <input class="input" id="accName" required value="${a?.nome || ""}" placeholder="Ex: M-Pesa"/>
-        </div>
-
-        <div class="field">
-          <label>Tipo</label>
-          <select class="input" id="accType">
-            ${["Mobile money", "Banco", "Dinheiro"]
-              .map((t) => `<option ${a?.tipo === t ? "selected" : ""}>${t}</option>`)
-              .join("")}
-          </select>
-        </div>
-
-        <div class="field">
-          <label>Saldo inicial (opcional)</label>
-          <input class="input" type="number" step="0.01" min="0" id="accSaldo" value="${a?.saldo ?? 0}"/>
-        </div>
-
-        <div class="field">
-          <label>Ativa?</label>
-          <select class="input" id="accActive">
-            <option value="true" ${a?.ativo !== false ? "selected" : ""}>Sim</option>
-            <option value="false" ${a?.ativo === false ? "selected" : ""}>Não</option>
-          </select>
-        </div>
-
-        <button class="btn big full" type="submit">${id ? "Guardar" : "Criar"}</button>
-      </form>
-    `
-  );
-}
-
-function deleteAccount(id) {
-  if (!guard("accounts.delete", "Só ADMIN pode apagar contas/formas de pagamento.")) return;
-  if (!confirm("Apagar esta conta?")) return;
-
-  db.accounts = db.accounts.filter((a) => a.id !== id);
-  touch();
-  renderAll();
-}
-
-/* =======================
-   Produtos
-======================= */
-function updateProfitNote() {
-  const p = Number(document.getElementById("prodPrice")?.value || 0);
-  const c = Number(document.getElementById("prodCost")?.value || 0);
-  const note = document.getElementById("profitNote");
-  if (note) note.textContent = `Lucro esperado: ${MT(p - c)}`;
-}
-
-function renderProductsList() {
-  const q = (document.getElementById("productSearch")?.value || "").toLowerCase();
-  const items = [...db.products].filter((p) => p.nome.toLowerCase().includes(q)).sort(byName);
-  const el = document.getElementById("productsList");
-  if (!el) return;
-
-  el.innerHTML = items.length
-    ? items
-        .map((p) => {
-          const lucro = Number(p.precoVenda) - Number(p.precoAquisicaoRef);
-          return `
-            <div class="item">
-              <h4>${p.nome} <span class="badge">${p.ativo ? "Ativo" : "Inativo"}</span></h4>
-              <div class="meta">
-                <span>Venda: ${MT(p.precoVenda)}</span>
-                <span>Aquisição: ${MT(p.precoAquisicaoRef)}</span>
-                <span>Lucro esp.: <strong>${MT(lucro)}</strong></span>
-                <span>Stock mín.: ${p.minStock}</span>
-              </div>
-              <div class="actions">
-                <button class="btn ghost" data-toggle-prod="${p.id}">${p.ativo ? "Desativar" : "Ativar"}</button>
-                <button class="btn danger" data-del-prod="${p.id}">Apagar</button>
-              </div>
-            </div>`;
-        })
-        .join("")
-    : `<div class="muted">Sem produtos.</div>`;
-}
-
-/* =======================
-   Produtos – Select Stock Base (UI)
-======================= */
-function renderProductStockBaseSelect() {
-  const sel = document.getElementById("prodStockBase");
-  if (!sel) return;
-
-  const current = sel.value || "";
-  const items = (db.products || [])
-    .filter(p => p && p.ativo !== false)
-    .sort((a,b)=> (a.nome||"").localeCompare(b.nome||""));
-
-  sel.innerHTML = `
-    <option value="">— Não (produto normal) —</option>
-    ${items.map(p => `<option value="${p.id}">${p.nome}</option>`).join("")}
-  `;
-
-  sel.value = current;
-}
-
-/* =======================
-   Clientes
-======================= */
-function renderCustomersList() {
-  const el = document.getElementById("customersList");
-  if (!el) return;
-
-  const items = [...db.customers].sort(byName);
-  el.innerHTML = items.length
-    ? items
-        .map(
-          (c) => `
-          <div class="item">
-            <h4>${c.nome}</h4>
-            <div class="meta">
-              <span>Tel: ${c.telefone || "—"}</span>
-              <span>${c.notas || ""}</span>
-            </div>
-            <div class="actions">
-              <button class="btn danger" data-del-cust="${c.id}">Apagar</button>
-            </div>
-          </div>`
-        )
-        .join("")
-    : `<div class="muted">Sem clientes.</div>`;
-}
-
-/* =======================
-   Armazém
-======================= */
-function renderWarehouse() {
-  const el = document.getElementById("warehouseList");
-  if (!el) return;
-
-  const items = db.products
-    .filter((p) => p.ativo)
-    .map((p) => ({ p, qty: invQty(p.id) }))
-    .sort((a, b) => a.p.nome.localeCompare(b.p.nome));
-
-  el.innerHTML = items.length
-    ? items
-        .map((x) => {
-          const low = x.p.minStock > 0 && x.qty <= x.p.minStock;
-          return `
-            <div class="item">
-              <h4>${x.p.nome} ${low ? `<span class="badge">Baixo</span>` : ""}</h4>
-              <div class="meta">
-                <span>Disponível: <strong>${x.qty}</strong></span>
-                <span>Stock mín.: ${x.p.minStock}</span>
-              </div>
-            </div>`;
-        })
-        .join("")
-    : `<div class="muted">Sem produtos ativos.</div>`;
-}
-
-/* =======================
-   Compras
-======================= */
-function renderBuysList() {
-  const el = document.getElementById("buysList");
-  if (!el) return;
-
-  const f = document.getElementById("buysFilterDate")?.value;
-  const items = [...db.purchases].filter((p) => !f || p.data === f).reverse();
-
-  el.innerHTML = items.length
-    ? items
-        .map((p) => {
-          const prod = productById(p.productId);
-          return `
-            <div class="item">
-              <h4>${MT(p.total)} <span class="badge">${p.data}</span></h4>
-              <div class="meta">
-                <span>Fornecedor: ${p.supplier}</span>
-                <span>Produto: ${prod?.nome || "—"}</span>
-                <span>${p.qty} x ${MT(p.costUnit)}</span>
-                <span>Conta: ${accountName(p.accountId)}</span>
-              </div>
-            </div>`;
-        })
-        .join("")
-    : `<div class="muted">Sem compras.</div>`;
-}
-
-/* =======================
-   Vendas
-======================= */
-function renderCatalog() {
-  const q = (document.getElementById("catalogSearch")?.value || "").toLowerCase();
-  const items = db.products
-    .filter((p) => p.ativo)
-    .filter((p) => !isGbBaseProduct(p)) // ✅ não mostra "GB" no catálogo
-    .filter((p) => p.nome.toLowerCase().includes(q))
-    .sort(byName);
-
-  const el = document.getElementById("catalogList");
-  if (!el) return;
-
-  el.innerHTML = items.length
-    ? items
-        .map((p) => {
-          const qty = stockForProduct(p.id); // ✅ stock vendável (base/factor)
-          const disabled = qty <= 0;
-          const img = p.img ? `<img src="${p.img}" alt="">` : "";
-          return `
-            <div class="pcard">
-              <div class="pimg">${img}</div>
-              <div class="pinfo">
-                <div class="pname">${p.nome}</div>
-                <div class="pmuted">
-                  <span>Preço: <strong>${MT(p.precoVenda)}</strong></span>
-                  <span>Stock: <strong>${qty}</strong></span>
-                </div>
-                <button class="btn padd ${disabled ? "ghost" : ""}" data-add="${p.id}" ${disabled ? "disabled" : ""}>
-                  ${disabled ? "Sem stock" : "Adicionar"}
-                </button>
-              </div>
-            </div>`;
-        })
-        .join("")
-    : `<div class="muted">Sem produtos no catálogo.</div>`;
-}
-
-function addToCart(productId) {
-  const p = productById(productId);
-  if (!p) return;
-
-  // stock necessário por 1 unidade (em base)
-  const needOne = consumptionQty(productId);
-
-  // ✅ valida usando stock vendável
-  if (stockForProduct(productId) < 1) {
-    return alert("Sem stock (base).");
-  }
-
-  const found = cart.find((i) => i.productId === productId);
-
-  if (found) {
-    // validar se ainda há base para +1
-    const needTotalBase = (found.qty + 1) * needOne;
-    const baseId = baseIdForProduct(productId);
-    if (needTotalBase > invQty(baseId)) return alert("Stock base insuficiente.");
-    found.qty += 1;
-  } else {
-    cart.push({ productId, qty: 1 });
-  }
-
-  renderCart();
-}
-
-function renderCart() {
-  const el = document.getElementById("cartList");
-  if (!el) return;
-
-  if (!cart.length) {
-    el.innerHTML = `<div class="muted">Carrinho vazio.</div>`;
-    const totalEl = document.getElementById("cartTotal");
-    if (totalEl) totalEl.textContent = MT(0);
-    return;
-  }
-
-  const rows = cart.map((i) => {
-    const p = productById(i.productId);
-    const stock = stockForProduct(i.productId); // ✅ stock vendável (base/factor)
-    const total = i.qty * Number(p?.precoVenda || 0);
-    return { i, p, stock, total };
-  });
-
-  const grand = rows.reduce((s, r) => s + r.total, 0);
-  const totalEl = document.getElementById("cartTotal");
-  if (totalEl) totalEl.textContent = MT(grand);
-
-  el.innerHTML = rows
-    .map(
-      (r) => `
-        <div class="item">
-          <h4>${r.p?.nome || "—"}</h4>
-          <div class="meta">
-            <span>${r.i.qty} x ${MT(r.p?.precoVenda)}</span>
-            <span>Total: <strong>${MT(r.total)}</strong></span>
-            <span>Stock: ${r.stock}</span>
-          </div>
-          <div class="actions">
-            <button class="btn ghost" data-dec="${r.i.productId}">-</button>
-            <button class="btn ghost" data-inc="${r.i.productId}">+</button>
-            <button class="btn danger" data-rem="${r.i.productId}">Remover</button>
-          </div>
-        </div>`
-    )
-    .join("");
-}
-
-function changeQty(productId, delta) {
-  const item = cart.find((x) => x.productId === productId);
-  if (!item) return;
-  const newQty = item.qty + delta;
-  if (newQty <= 0) return removeFromCart(productId);
-
-  // ✅ valida stock vendável (pacote usa base)
-  if (newQty > stockForProduct(productId)) return alert("Stock insuficiente (base).");
-
-  item.qty = newQty;
-  renderCart();
-}
-
-function removeFromCart(productId) {
-  cart = cart.filter((x) => x.productId !== productId);
-  renderCart();
-}
-
-function finalizeSale() {
-  if (!guard("sales.create", "Sem permissão para registrar vendas.")) return;
-  if (!cart.length) return alert("Carrinho vazio.");
-
-  const customerId = document.getElementById("saleCustomer")?.value;
-  const accountId = document.getElementById("saleAccount")?.value;
-  const date = document.getElementById("saleDate")?.value || todayISO();
-
-  if (!customerId) return alert("Selecione o cliente.");
-  if (!accountId) return alert("Selecione a conta.");
-
-  // ✅ valida stock BASE real (em unidades do base)
-  for (const i of cart) {
-    const baseId = baseIdForProduct(i.productId);
-    const need = i.qty * consumptionQty(i.productId);
-    if (need > invQty(baseId)) {
-      const baseName = productById(baseId)?.nome || "Stock base";
-      return alert(`Stock insuficiente em: ${baseName}`);
-    }
-  }
-
-  const items = cart.map((i) => {
-    const p = productById(i.productId);
-    const costUnit = costUnitFor(i.productId);
-    return { productId: i.productId, qty: i.qty, priceUnit: Number(p?.precoVenda || 0), costUnit };
-  });
-
-  const total = items.reduce((s, it) => s + it.qty * it.priceUnit, 0);
-  const totalCost = items.reduce((s, it) => s + it.qty * it.costUnit, 0);
-  const profit = total - totalCost;
-
-  const sale = { id: uid(), data: date, customerId, accountId, items, total, totalCost, profit };
-  db.sales.push(sale);
-
-  try {
-    items.forEach((it) => consumeStockForSaleItem(it.productId, it.qty)); // ✅ baixa no BASE
-  } catch (err) {
-    return alert(err?.message || "Erro ao baixar stock.");
-  }
-
-  addLedger({
-    date,
-    type: "in",
-    accountId,
-    amount: total,
-    refType: "sale",
-    refId: sale.id,
-    note: `Venda ${customerName(customerId)}`
-  });
-
-  cart = [];
-  touch();
-  renderAll();
-  alert("Venda registrada com sucesso!");
-}
-
-function renderSalesList() {
-  const el = document.getElementById("salesList");
-  if (!el) return;
-
-  const f = document.getElementById("salesFilterDate")?.value;
-  const items = [...db.sales].filter((s) => !f || s.data === f).reverse();
-
-  el.innerHTML = items.length
-    ? items
-        .map(
-          (s) => `
-          <div class="item">
-            <h4>${MT(s.total)} <span class="badge">${s.data}</span></h4>
-            <div class="meta">
-              <span>Cliente: ${customerName(s.customerId)}</span>
-              <span>Conta: ${accountName(s.accountId)}</span>
-              <span>Lucro (estim.): <strong>${MT(s.profit)}</strong></span>
-              <span>${s.items.length} itens</span>
-            </div>
-          </div>`
-        )
-        .join("")
-    : `<div class="muted">Sem vendas.</div>`;
-}
-
-/* =======================
-   Selects
-======================= */
-function renderSelects() {
-  const accActive = db.accounts.filter((a) => a.ativo).sort(byName);
-  const custs = [...db.customers].sort(byName);
-  const prods = db.products.filter((p) => p.ativo).sort(byName);
-
-  const saleAcc = document.getElementById("saleAccount");
-  if (saleAcc) saleAcc.innerHTML = accActive.map((a) => `<option value="${a.id}">${a.nome}</option>`).join("");
-
-  const buyAcc = document.getElementById("buyAccount");
-  if (buyAcc) buyAcc.innerHTML = accActive.map((a) => `<option value="${a.id}">${a.nome}</option>`).join("");
-
-  const saleCust = document.getElementById("saleCustomer");
-  if (saleCust) saleCust.innerHTML = custs.map((c) => `<option value="${c.id}">${c.nome}</option>`).join("");
-
-  const buyProd = document.getElementById("buyProduct");
-  if (buyProd) buyProd.innerHTML = prods.map((p) => `<option value="${p.id}">${p.nome}</option>`).join("");
-}
-
-/* =======================
-   Reports (base)
-======================= */
-function renderReportsBase() {
-  const elQuick = document.getElementById("reportQuick");
-  const elStock = document.getElementById("reportStock");
-  if (!elQuick || !elStock) return;
-
-  const d = todayISO();
-  const sales = db.sales.filter((s) => s.data === d);
-  const buys = db.purchases.filter((p) => p.data === d);
-  const totalSales = sales.reduce((s, x) => s + x.total, 0);
-  const totalBuys = buys.reduce((s, x) => s + x.total, 0);
-  const profit = sales.reduce((s, x) => s + x.profit, 0);
-
-  elQuick.innerHTML = `
-    <div class="item">
-      <h4>Hoje (${d})</h4>
-      <div class="meta">
-        <span>Vendas: <strong>${MT(totalSales)}</strong></span>
-        <span>Compras: <strong>${MT(totalBuys)}</strong></span>
-        <span>Lucro (estim.): <strong>${MT(profit)}</strong></span>
-      </div>
-    </div>
-  `;
-
-  const lows = db.products
-    .filter((p) => p.ativo)
-.map((p) => ({ p, qty: stockForProduct(p.id) }))
-    .filter((x) => x.p.minStock > 0 && x.qty <= x.p.minStock);
-
-  elStock.innerHTML = lows.length
-    ? lows
-        .map(
-          (x) => `
-          <div class="item">
-            <h4>${x.p.nome}</h4>
-            <div class="meta">
-              <span>Stock: <strong>${x.qty}</strong></span>
-              <span>Mínimo: ${x.p.minStock}</span>
-            </div>
-          </div>`
-        )
-        .join("")
-    : `<div class="muted">Sem stock baixo agora.</div>`;
-}
-
-/* =======================
-   User badge (top)
-======================= */
-function renderUserBadge() {
-  const el = document.getElementById("userBadge");
-  if (!el) return;
-  const u = currentUser();
-  el.textContent = u ? `👤 ${u.nome} (${u.role})` : "👤 —";
-}
-
-/* =======================
-   CONFIG -> UTILIZADORES (Admin)
-======================= */
-function safeText(s) {
-  return String(s ?? "").replace(/[<>&"]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" }[c]));
-}
-
-function renderUsersSection() {
-  ensureAuthModel();
-  const card = document.getElementById("usersCard");
-  const list = document.getElementById("usersList");
-  if (!card || !list) return;
-
-  if (!isAdmin()) {
-    card.style.display = "none";
-    return;
-  }
-  card.style.display = "block";
-
-  const users = [...db.users].sort((a, b) => (a.nome || "").localeCompare(b.nome || ""));
-  const me = currentUser();
-
-  list.innerHTML = users.length
-    ? users
-        .map((u) => {
-          const isMe = me && me.id === u.id;
-          const hasQA = !!u.securityQuestion && !!u.securityAnswerHash;
-
-          return `
-            <div class="item">
-              <h4>${safeText(u.nome)} <span class="badge">${safeText(u.role)}</span></h4>
-              <div class="meta">
-                <span>Status: <strong>${u.ativo === false ? "Inativo" : "Ativo"}</strong></span>
-                <span>Recuperação PIN: <strong>${hasQA ? "Definida" : "Não definida"}</strong></span>
-                <span>Criado: ${u.createdAt ? new Date(u.createdAt).toLocaleDateString() : "—"}</span>
-                ${isMe ? `<span class="badge">Você</span>` : ``}
-              </div>
-              <div class="actions">
-                <button class="btn ghost" data-user-edit="${u.id}">Editar</button>
-                <button class="btn ghost" data-user-pin="${u.id}">Reset PIN (Admin)</button>
-                <button class="btn ghost" data-user-qa="${u.id}">Pergunta/PIN</button>
-                <button class="btn ${u.ativo === false ? "ghost" : "danger"}" data-user-toggle="${u.id}">
-                  ${u.ativo === false ? "Ativar" : "Desativar"}
-                </button>
-              </div>
-            </div>`;
-        })
-        .join("")
-    : `<div class="muted">Sem utilizadores.</div>`;
-}
-
-function modalUser(id = null) {
-  if (!isAdmin()) return alert("Só ADMIN pode gerir utilizadores.");
-
-  const first = db.users.length === 0;
-  const u = id ? db.users.find((x) => x.id === id) : null;
-
-  openModal(
-    id ? "Editar utilizador" : "Novo utilizador",
-    `
-      <form id="userForm" class="form2" ${id ? `data-edit-id="${id}"` : ""}>
-        <div class="field full">
-          <label>Nome</label>
-          <input class="input" id="uName" required value="${safeText(u?.nome || "")}" placeholder="Ex: Caixa 1"/>
-        </div>
-
-        <div class="field">
-          <label>Nível</label>
-          <select class="input" id="uRole" ${first ? "disabled" : ""}>
-            <option value="admin" ${u?.role === "admin" ? "selected" : ""}>Admin</option>
-            <option value="manager" ${u?.role === "manager" ? "selected" : ""}>Gestão</option>
-            <option value="staff" ${u?.role === "staff" ? "selected" : ""}>Caixa</option>
-          </select>
-          ${first ? `<small class="muted">Primeiro utilizador tem de ser Admin.</small>` : ``}
-        </div>
-
-        <div class="field">
-          <label>${id ? "Novo PIN (deixe vazio para manter)" : "PIN (4–8 dígitos)"}</label>
-          <input class="input" id="uPin" type="password" inputmode="numeric" placeholder="ex: 1234"/>
-        </div>
-
-        <button class="btn big full" type="submit">${id ? "Guardar" : "Criar"}</button>
-      </form>
-    `
-  );
-}
-
-function modalSetQA(userId) {
-  if (!isAdmin()) return alert("Só ADMIN pode definir pergunta/recuperação.");
-  const u = db.users.find((x) => x.id === userId);
-  if (!u) return;
-
-  openModal(
-    "Definir recuperação de PIN",
-    `
-      <form id="qaForm" class="form2" data-qa-id="${userId}">
-        <div class="field full">
-          <label>Utilizador</label>
-          <input class="input" value="${safeText(u.nome)}" disabled />
-        </div>
-
-        <div class="field full">
-          <label>Pergunta de segurança</label>
-          <input class="input" id="qaQuestion" required value="${safeText(u.securityQuestion || "")}" placeholder="Ex: Qual é o nome da sua mãe?"/>
-        </div>
-
-        <div class="field full">
-          <label>Resposta (não guarda em texto; só hash)</label>
-          <input class="input" id="qaAnswer" required placeholder="Digite a resposta..." />
-        </div>
-
-        <button class="btn big full" type="submit">Guardar</button>
-      </form>
-    `
-  );
-}
-
-function modalChangePinForced() {
-  const u = currentUser();
-  if (!u) return;
-
-  openModal(
-    "Alterar PIN (obrigatório)",
-    `
-      <form id="forcePinForm" class="form2">
-        <div class="field full">
-          <label>Seu nome</label>
-          <input class="input" value="${safeText(u.nome)}" disabled />
-        </div>
-
-        <div class="field full">
-          <label>PIN atual</label>
-          <input class="input" id="forceOldPin" type="password" inputmode="numeric" required />
-        </div>
-
-        <div class="field full">
-          <label>Novo PIN (4–8 dígitos)</label>
-          <input class="input" id="forceNewPin" type="password" inputmode="numeric" required />
-        </div>
-
-        <button class="btn big full" type="submit">Alterar</button>
-      </form>
-      <p class="muted" style="margin-top:8px">Como o Admin fez reset, você precisa definir um novo PIN.</p>
-    `
-  );
-}
-/* =======================
-   RELATÓRIOS VISUAIS (12)
-   (Sem mexer no HTML: cria UI por JS dentro da página #relatorios)
-======================= */
-
-function ensureReportsVisualContainer() {
-  const page = document.getElementById("relatorios");
-  if (!page) return null;
-
-  let host = document.getElementById("reportsVisual");
-  if (!host) {
-    host = document.createElement("div");
-    host.id = "reportsVisual";
-    host.className = "grid";
-    host.style.gap = "12px";
-    page.appendChild(host);
-  }
-  return host;
-}
-
-function fmt(n) {
-  return MT(Number(n || 0));
-}
-
-function toISO(d) {
-  return new Date(d).toISOString().slice(0, 10);
-}
-
-function addDays(iso, days) {
-  const d = new Date(iso);
-  d.setDate(d.getDate() + days);
-  return toISO(d);
-}
-
-function daysBack(n, endISO = todayISO()) {
-  // lista de datas ISO do (end-n+1) até end
-  const arr = [];
-  for (let i = n - 1; i >= 0; i--) arr.push(addDays(endISO, -i));
-  return arr;
-}
-
-function sum(arr, fn) {
-  return (arr || []).reduce((s, x) => s + Number(fn(x) || 0), 0);
-}
-
-function groupBy(arr, keyFn) {
-  return (arr || []).reduce((m, x) => {
-    const k = keyFn(x);
-    (m[k] = m[k] || []).push(x);
-    return m;
-  }, {});
-}
-
-function barRow(label, value, maxValue, suffix = "") {
-  const pct = maxValue > 0 ? Math.max(0, Math.min(100, (value / maxValue) * 100)) : 0;
-  return `
-    <div style="display:grid; grid-template-columns: 120px 1fr 110px; gap:10px; align-items:center; margin:8px 0;">
-      <div class="muted" style="font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${label}</div>
-      <div style="height:10px; border:1px solid var(--line); border-radius:999px; background: rgba(255,255,255,.03); overflow:hidden;">
-        <div style="height:100%; width:${pct}%; background: rgba(94,234,212,.55);"></div>
-      </div>
-      <div style="text-align:right; font-weight:800; font-size:12px;">${suffix}${value}</div>
-    </div>
-  `;
-}
-
-function card(title, subtitle, innerHTML) {
-  return `
-    <div class="card">
-      <div class="row between" style="gap:10px; align-items:flex-start;">
-        <div>
-          <h3 style="margin:0; font-size:16px;">${title}</h3>
-          <div class="muted" style="margin-top:4px;">${subtitle || ""}</div>
-        </div>
-      </div>
-      <div style="margin-top:12px;">${innerHTML || ""}</div>
-    </div>
-  `;
-}
-
-function getSellableStockForReport(p) {
-  // mostra stock vendável para pacotes e stock real para normais
-  // usando o teu modelo atual: stockBaseId + stockConsumeQty
-  const baseId = (p && p.stockBaseId) ? p.stockBaseId : p.id;
-  const consume = Math.max(1, Number(p?.stockConsumeQty || 1));
-  const baseQty = invQty(baseId);
-  // se for pacote (tem stockBaseId), vendável = floor(baseQty / consume)
-  if (p && p.stockBaseId) return Math.floor(baseQty / consume);
-  return baseQty;
-}
-
-function renderReportsVisual() {
-  const host = ensureReportsVisualContainer();
-  if (!host) return;
-
-  // Períodos padrão
-  const end = todayISO();
-  const last14 = daysBack(14, end);
-  const last30 = daysBack(30, end);
-
-  const sales = db.sales || [];
-  const buys = db.purchases || [];
-  const prods = (db.products || []).filter(p => p && p.ativo);
-
-  // Helpers: sales por dia
-  const salesByDay = groupBy(sales, s => s.data);
-  const buysByDay = groupBy(buys, b => b.data);
-
-  // 1) Vendas (valor) últimos 14 dias
-  const seriesSales14 = last14.map(d => ({
-    d,
-    v: sum(salesByDay[d] || [], x => x.total)
-  }));
-  const maxSales14 = Math.max(...seriesSales14.map(x => x.v), 0);
-  const htmlSales14 = seriesSales14.map(x => barRow(x.d.slice(5), Number(x.v.toFixed(2)), maxSales14, "")).join("");
-
-  // 2) Lucro últimos 14 dias
-  const seriesProfit14 = last14.map(d => ({
-    d,
-    v: sum(salesByDay[d] || [], x => x.profit)
-  }));
-  const maxProfit14 = Math.max(...seriesProfit14.map(x => x.v), 0);
-  const htmlProfit14 = seriesProfit14.map(x => barRow(x.d.slice(5), Number(x.v.toFixed(2)), maxProfit14, "")).join("");
-
-  // 3) Nº de vendas últimos 14 dias
-  const seriesCount14 = last14.map(d => ({
-    d,
-    v: (salesByDay[d] || []).length
-  }));
-  const maxCount14 = Math.max(...seriesCount14.map(x => x.v), 0);
-  const htmlCount14 = seriesCount14.map(x => barRow(x.d.slice(5), x.v, maxCount14, "")).join("");
-
-  // 4) Ticket médio (30 dias)
-  const sales30 = sales.filter(s => last30.includes(s.data));
-  const total30 = sum(sales30, s => s.total);
-  const count30 = sales30.length || 0;
-  const avgTicket30 = count30 ? (total30 / count30) : 0;
-
-  // 5) Top produtos por Receita
-  const revenueByProd = {};
-  sales.forEach(s => (s.items || []).forEach(it => {
-    revenueByProd[it.productId] = (revenueByProd[it.productId] || 0) + (Number(it.qty) * Number(it.priceUnit));
-  }));
-  const topRevenue = Object.entries(revenueByProd)
-    .map(([productId, v]) => ({ productId, v }))
-    .sort((a,b) => b.v - a.v)
-    .slice(0, 10);
-
-  const maxTopRev = Math.max(...topRevenue.map(x => x.v), 0);
-  const htmlTopRev = topRevenue.length
-    ? topRevenue.map(x => barRow(productById(x.productId)?.nome || "—", Number(x.v.toFixed(2)), maxTopRev, "MT ")).join("")
-    : `<div class="muted">Sem vendas ainda.</div>`;
-
-  // 6) Top produtos por Quantidade
-  const qtyByProd = {};
-  sales.forEach(s => (s.items || []).forEach(it => {
-    qtyByProd[it.productId] = (qtyByProd[it.productId] || 0) + Number(it.qty || 0);
-  }));
-  const topQty = Object.entries(qtyByProd)
-    .map(([productId, v]) => ({ productId, v }))
-    .sort((a,b) => b.v - a.v)
-    .slice(0, 10);
-
-  const maxTopQty = Math.max(...topQty.map(x => x.v), 0);
-  const htmlTopQty = topQty.length
-    ? topQty.map(x => barRow(productById(x.productId)?.nome || "—", x.v, maxTopQty, "")).join("")
-    : `<div class="muted">Sem vendas ainda.</div>`;
-
-  // 7) Margem por produto (lucro unitário estimado)
-  const marginList = prods
-    .filter(p => p.kind !== "base_gb")
-    .map(p => ({
-      nome: p.nome,
-      m: Number(p.precoVenda || 0) - Number(costUnitFor(p.id) || 0)
-    }))
-    .sort((a,b) => b.m - a.m)
-    .slice(0, 10);
-
-  const maxMargin = Math.max(...marginList.map(x => x.m), 0);
-  const htmlMargins = marginList.length
-    ? marginList.map(x => barRow(x.nome, Number(x.m.toFixed(2)), maxMargin, "MT ")).join("")
-    : `<div class="muted">Sem produtos.</div>`;
-
-  // 8) Stock atual + stock vendável (inclui pacotes)
-  const stockRows = prods
-    .filter(p => p.kind !== "base_gb") // não listar o base no relatório vendável (opcional)
-    .map(p => {
-      const baseId = (p.stockBaseId ? p.stockBaseId : p.id);
-      const baseName = productById(baseId)?.nome || "—";
-      const baseQty = invQty(baseId);
-      const consume = Math.max(1, Number(p.stockConsumeQty || 1));
-      const sellable = getSellableStockForReport(p);
-      const isPack = !!p.stockBaseId;
-
-      return `
-        <div class="item">
-          <h4 style="margin:0 0 6px;">${p.nome} ${isPack ? `<span class="badge">Pacote</span>` : ""}</h4>
-          <div class="meta">
-            <span>Vendável: <strong>${sellable}</strong></span>
-            <span>Base: <strong>${baseName}</strong></span>
-            <span>Stock base: <strong>${baseQty}</strong></span>
-            ${isPack ? `<span>Consumo: <strong>${consume}</strong> por unidade</span>` : ""}
-          </div>
-        </div>
-      `;
-    });
-
-  const htmlStockSellable = stockRows.length ? stockRows.join("") : `<div class="muted">Sem produtos.</div>`;
-
-  // 9) Stock baixo (alertas) com vendável quando for pacote
-  const lowList = prods
-    .filter(p => p.minStock > 0)
-    .map(p => ({ p, vend: getSellableStockForReport(p) }))
-    .filter(x => x.vend <= x.p.minStock)
-    .sort((a,b) => a.vend - b.vend);
-
-  const htmlLow = lowList.length
-    ? lowList.map(x => `
-        <div class="item">
-          <h4 style="margin:0 0 6px;">${x.p.nome} ${x.p.stockBaseId ? `<span class="badge">Pacote</span>` : ""}</h4>
-          <div class="meta">
-            <span>Vendável: <strong>${x.vend}</strong></span>
-            <span>Mínimo: <strong>${x.p.minStock}</strong></span>
-          </div>
-        </div>
-      `).join("")
-    : `<div class="muted">Sem alertas de stock mínimo.</div>`;
-
-  // 10) Compras por fornecedor (top 8)
-  const bySupplier = {};
-  buys.forEach(b => {
-    const k = (b.supplier || "—").trim() || "—";
-    bySupplier[k] = (bySupplier[k] || 0) + Number(b.total || 0);
-  });
-  const topSup = Object.entries(bySupplier)
-    .map(([supplier, v]) => ({ supplier, v }))
-    .sort((a,b) => b.v - a.v)
-    .slice(0, 8);
-
-  const maxSup = Math.max(...topSup.map(x => x.v), 0);
-  const htmlSup = topSup.length
-    ? topSup.map(x => barRow(x.supplier, Number(x.v.toFixed(2)), maxSup, "MT ")).join("")
-    : `<div class="muted">Sem compras ainda.</div>`;
-
-  // 11) Fluxo por conta (entradas/saídas)
-  const accs = (db.accounts || []).filter(a => a.ativo !== false);
-  const flow = accs.map(a => {
-    const ins = sum(db.ledger || [], l => (l.accountId === a.id && l.type === "in") ? l.amount : 0);
-    const outs = sum(db.ledger || [], l => (l.accountId === a.id && l.type === "out") ? l.amount : 0);
-    const bal = calcAccountBalance(a.id);
-    return { nome: a.nome, ins, outs, bal };
-  });
-
-  const maxFlow = Math.max(...flow.map(x => Math.max(x.ins, x.outs)), 0);
-  const htmlFlow = flow.length
-    ? flow.map(x => `
-        <div class="item">
-          <h4 style="margin:0 0 6px;">${x.nome}</h4>
-          <div style="margin-top:6px">
-            ${barRow("Entradas", Number(x.ins.toFixed(2)), maxFlow, "MT ")}
-            ${barRow("Saídas", Number(x.outs.toFixed(2)), maxFlow, "MT ")}
-          </div>
-          <div class="meta"><span>Saldo atual: <strong>${fmt(x.bal)}</strong></span></div>
-        </div>
-      `).join("")
-    : `<div class="muted">Sem contas.</div>`;
-
-  // 12) Top clientes por total
-  const byCust = {};
-  sales.forEach(s => {
-    const k = s.customerId || "—";
-    byCust[k] = (byCust[k] || 0) + Number(s.total || 0);
-  });
-  const topCust = Object.entries(byCust)
-    .map(([customerId, v]) => ({ customerId, v }))
-    .sort((a,b) => b.v - a.v)
-    .slice(0, 10);
-
-  const maxCust = Math.max(...topCust.map(x => x.v), 0);
-  const htmlCust = topCust.length
-    ? topCust.map(x => barRow(customerName(x.customerId), Number(x.v.toFixed(2)), maxCust, "MT ")).join("")
-    : `<div class="muted">Sem vendas ainda.</div>`;
-
-  // Montagem final (12 cards)
-  const cards = [
-    card("1) Vendas (14 dias)", "Valor total por dia", htmlSales14),
-    card("2) Lucro (14 dias)", "Lucro estimado por dia", htmlProfit14),
-    card("3) Nº de vendas (14 dias)", "Quantidade de vendas por dia", htmlCount14),
-
-    card("4) Ticket médio (30 dias)", "Média por venda", `
-      <div class="item">
-        <div class="meta">
-          <span>Total 30d: <strong>${fmt(total30)}</strong></span>
-          <span>Vendas: <strong>${count30}</strong></span>
-          <span>Ticket médio: <strong>${fmt(avgTicket30)}</strong></span>
-        </div>
-      </div>
-    `),
-
-    card("5) Top produtos (Receita)", "Top 10 por valor vendido", htmlTopRev),
-    card("6) Top produtos (Quantidade)", "Top 10 por unidades vendidas", htmlTopQty),
-    card("7) Margem estimada", "Top 10 por lucro unitário (estimado)", htmlMargins),
-
-    card("8) Stock vendável", "Pacotes mostram vendável (base ÷ consumo)", htmlStockSellable),
-    card("9) Alertas de stock", "Comparação com stock mínimo", htmlLow),
-
-    card("10) Compras por fornecedor", "Top por valor comprado", htmlSup),
-    card("11) Fluxo por conta", "Entradas/saídas e saldo", htmlFlow),
-    card("12) Top clientes", "Top 10 por total comprado", htmlCust),
-  ];
-
-  host.innerHTML = `
-    <div class="grid two" style="gap:12px;">
-      ${cards.join("")}
-    </div>
-  `;
-}
-
-/* =======================
-   Render all
-======================= */
-function renderAll() {
-  renderSelects();
-  renderHome();
-  renderProductsList();
-  renderCustomersList();
-  renderWarehouse();
-  renderCatalog();
-  renderCart();
-  renderSalesList();
-  renderBuysList();
-  renderReportsBase();
-  renderUsersSection();
-  renderUserBadge();
-  renderProductStockBaseSelect();
-  renderReportsVisual();
-
-}
-
-/* =======================
-   Mobile helpers
-======================= */
-function applyMobileClass() {
-  const isMobile = window.innerWidth <= 900 || window.matchMedia("(pointer: coarse)").matches;
-  document.body.classList.toggle("is-mobile", isMobile);
-}
-
-/* =======================
-   BOOT (um único DOMContentLoaded)
-======================= */
-window.addEventListener("DOMContentLoaded", async () => {
-  bootAuthGate();
-
-  const modalClose = document.getElementById("modalClose");
-  if (modalClose) modalClose.addEventListener("click", closeModal);
-  const modal = document.getElementById("modal");
-  if (modal) modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
-
-  document.querySelectorAll(".mitem").forEach((btn) => btn.addEventListener("click", () => go(btn.dataset.page)));
-  document.querySelectorAll("[data-nav]").forEach((btn) => btn.addEventListener("click", () => go(btn.dataset.nav)));
-
-  const sidebarToggle = document.getElementById("sidebarToggle");
-  const overlay = document.getElementById("overlay");
-
-  const saved = localStorage.getItem("sidebarCollapsed");
-  if (saved === "1") document.body.classList.add("sidebar-collapsed");
-
-  if (sidebarToggle) {
-    sidebarToggle.addEventListener("click", () => {
-      if (window.matchMedia("(max-width: 860px)").matches) {
-        document.body.classList.toggle("menu-open");
-      } else {
-        document.body.classList.toggle("sidebar-collapsed");
-        localStorage.setItem(
-          "sidebarCollapsed",
-          document.body.classList.contains("sidebar-collapsed") ? "1" : "0"
-        );
-      }
-    });
-  }
-
-  if (overlay) overlay.addEventListener("click", () => document.body.classList.remove("menu-open"));
-  document.addEventListener("click", (e) => {
-    const item = e.target.closest(".mitem");
-    if (item && window.matchMedia("(max-width: 860px)").matches) {
-      document.body.classList.remove("menu-open");
-    }
-  });
-
-  applyMobileClass();
-  window.addEventListener("resize", applyMobileClass);
-
-  const btnLogoutTop = document.getElementById("btnLogoutTop");
-  if (btnLogoutTop) btnLogoutTop.addEventListener("click", (e) => { e.preventDefault(); doLogout(); });
-
-  const btnQuickSale = document.getElementById("btnQuickSale");
-  if (btnQuickSale) btnQuickSale.addEventListener("click", () => go("vendas"));
-
-  const prodPrice = document.getElementById("prodPrice");
-  const prodCost = document.getElementById("prodCost");
-  if (prodPrice) prodPrice.addEventListener("input", updateProfitNote);
-  if (prodCost) prodCost.addEventListener("input", updateProfitNote);
-
-  const btnClearCart = document.getElementById("btnClearCart");
-  if (btnClearCart) btnClearCart.addEventListener("click", () => { cart = []; renderCart(); });
-
-  const btnCheckout = document.getElementById("btnCheckout");
-  if (btnCheckout) btnCheckout.addEventListener("click", finalizeSale);
-
-  const productSearch = document.getElementById("productSearch");
-  if (productSearch) productSearch.addEventListener("input", renderProductsList);
-
-  const catalogSearch = document.getElementById("catalogSearch");
-  if (catalogSearch) catalogSearch.addEventListener("input", renderCatalog);
-
-  const buysFilterDate = document.getElementById("buysFilterDate");
-  if (buysFilterDate) buysFilterDate.addEventListener("input", renderBuysList);
-
-  const btnClearBuysFilter = document.getElementById("btnClearBuysFilter");
-  if (btnClearBuysFilter) btnClearBuysFilter.addEventListener("click", () => {
-    const el = document.getElementById("buysFilterDate");
-    if (el) el.value = "";
-    renderBuysList();
-  });
-
-  const salesFilterDate = document.getElementById("salesFilterDate");
-  if (salesFilterDate) salesFilterDate.addEventListener("input", renderSalesList);
-
-  const btnClearSalesFilter = document.getElementById("btnClearSalesFilter");
-  if (btnClearSalesFilter) btnClearSalesFilter.addEventListener("click", () => {
-    const el = document.getElementById("salesFilterDate");
-    if (el) el.value = "";
-    renderSalesList();
-  });
-
-  const btnExport = document.getElementById("btnExport");
-  if (btnExport) {
-    btnExport.addEventListener("click", () => {
-      const blob = new Blob([JSON.stringify(db, null, 2)], { type: "application/json" });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `gestao-facil-backup-${todayISO()}.json`;
-      a.click();
-    });
-  }
-
-  const importFile = document.getElementById("importFile");
-  if (importFile) {
-    importFile.addEventListener("change", async (e) => {
-      const f = e.target.files?.[0];
-      if (!f) return;
-      try {
-        const data = JSON.parse(await f.text());
-        db = data;
-        saveLocal(db);
-        alert("Importado com sucesso!");
-        await initSupabaseIfConfigured();
-        renderAll();
-      } catch {
-        alert("Backup inválido.");
-      } finally {
-        e.target.value = "";
-      }
-    });
-  }
-
-  const btnReset = document.getElementById("btnReset");
-  if (btnReset) {
-    btnReset.addEventListener("click", () => {
-      if (!guard("system.reset", "Só ADMIN pode apagar tudo.")) return;
-      if (confirm("Apagar tudo?")) {
-        localStorage.removeItem(KEY);
-        localStorage.removeItem(BACKUP_KEY);
-        location.reload();
-      }
-    });
-  }
-
-  const sbUrl = document.getElementById("sbUrl");
-  const sbKey = document.getElementById("sbKey");
-  if (sbUrl) sbUrl.value = db.online?.url || "";
-  if (sbKey) sbKey.value = db.online?.key || "";
-
-  const btnSaveOnline = document.getElementById("btnSaveOnline");
-  if (btnSaveOnline) {
-    btnSaveOnline.addEventListener("click", async () => {
-      db.online.url = document.getElementById("sbUrl")?.value?.trim() || "";
-      db.online.key = document.getElementById("sbKey")?.value?.trim() || "";
-      touch();
-      await initSupabaseIfConfigured();
-      alert(supabase ? "Online ativado! Agora pode sincronizar." : "Offline (chaves vazias).");
-    });
-  }
-
-  const btnSync = document.getElementById("btnSync");
-  if (btnSync) btnSync.addEventListener("click", syncNow);
-
-  const autoMin = document.getElementById("autoBackupMinutes");
-  if (autoMin) {
+    // settings
     db.settings = db.settings || {};
-    if (!db.settings.autoBackupMinutes) db.settings.autoBackupMinutes = 10;
-    autoMin.value = db.settings.autoBackupMinutes;
+    db.settings.autoSnapshots =
+    typeof db.settings.autoSnapshots === "boolean" ?
+    db.settings.autoSnapshots :
+    base.settings.autoSnapshots;
 
-    autoMin.addEventListener("change", () => {
-      db.settings.autoBackupMinutes = Math.max(5, Number(autoMin.value || 10));
-      touch();
-      alert("Auto-backup atualizado!");
-    });
+    db.settings.snapshotRetention =
+    Number.isFinite(db.settings.snapshotRetention) ?
+    db.settings.snapshotRetention :
+    base.settings.snapshotRetention;
+
+    // online
+    db.online = db.online || {};
+    db.online.enabled = !!db.online.enabled;
+    db.online.url = db.online.url || "";
+    db.online.key = db.online.key || "";
+
+    // meta
+    db.meta = db.meta || base.meta;
+    db.meta.version = db.meta.version || base.meta.version;
+    db.meta.updatedAt = nowISO();
+
+    return db;
+  }
+  function repEnsureUpdatedAt(obj) {
+    if (!obj || typeof obj !== "object") return obj;
+    if (!obj.createdAt) obj.createdAt = nowISO();
+    if (!obj.updatedAt) obj.updatedAt = obj.createdAt;
+    return obj;
   }
 
-  const btnRestoreSnap = document.getElementById("btnRestoreAutoSnapshot");
-  if (btnRestoreSnap) btnRestoreSnap.addEventListener("click", () => restoreAutoSnapshotByIndexFromEnd(0));
-
-  updateBackupStatusUI();
-
-  const btnGoRegister = document.getElementById("btnGoRegister");
-  const btnBackLogin = document.getElementById("btnBackLogin");
-  const btnLogin = document.getElementById("btnLogin");
-  const btnRegister = document.getElementById("btnRegister");
-  const btnForgotPin = document.getElementById("btnForgotPin");
-
-  if (btnGoRegister) {
-    btnGoRegister.addEventListener("click", () => {
-      setRegisterCopy();
-      showAuthScreen("register");
+  function ensureAllUpdatedAt(db) {
+    const cols = ["users", "products", "clients", "accounts", "sales", "purchases", "ledger", "inventory", "audit"];
+    cols.forEach(k => {
+      db[k] = Array.isArray(db[k]) ? db[k] : [];
+      db[k].forEach(repEnsureUpdatedAt);
     });
-  }
-  if (btnBackLogin) {
-    btnBackLogin.addEventListener("click", () => {
-      refreshLoginUsers();
-      showAuthScreen("login");
-    });
+    return db;
   }
 
-  if (btnForgotPin) {
-    btnForgotPin.addEventListener("click", () => {
-      const selName = document.getElementById("loginUser")?.value || "";
-      const u = db.users.find((x) => x.nome === selName);
-      if (!u) return alert("Selecione o utilizador.");
+  /* =======================
+   Daily snapshot (1x por dia)
+  ======================= */
+  function shouldRunDailySnapshot() {
+    const ws = localStorage.getItem(WS_KEY) || workspaceId || "no_ws";
+    const key = `gf_daily_snap_${ws}`;
+    return localStorage.getItem(key) !== todayISO();
+  }
 
-      if (!u.securityQuestion || !u.securityAnswerHash) {
-        return alert("Este utilizador ainda não tem pergunta de segurança definida. Peça ao Admin para definir.");
+
+  function markDailySnapshotDone() {
+    const ws = localStorage.getItem(WS_KEY) || workspaceId || "no_ws";
+    const key = `gf_daily_snap_${ws}`;
+    localStorage.setItem(key, todayISO());
+  }
+
+
+  function saveDBTouch() {
+    db.meta.updatedAt = nowISO();
+    save(DB_KEY, db);
+  }
+
+  function canManage() {
+    return session && (session.role === "admin" || session.role === "manager");
+  }
+
+  function getSessionUser() {var _session;
+    if (!((_session = session) !== null && _session !== void 0 && _session.userId)) return null;
+    return (db.users || []).find(u => u.id === session.userId) || null;
+  }
+
+  /* =======================
+     Auditoria (append-only)
+  ======================= */
+  function safeMeta(meta) {
+    const blocked = ["pin", "sbKey", "supabaseKey", "password", "key"];
+    const m = JSON.parse(JSON.stringify(meta || {}));
+    blocked.forEach(k => {
+      if (k in m) delete m[k];
+    });
+    return m;
+  }
+
+  function logAction(action, entityType = "", entityId = "", meta = {}) {
+    try {var _session2, _session3;
+      const u = getSessionUser();
+      db.audit.push({
+        id: uid(),
+        ts: nowISO(),
+        workspaceId: workspaceId || "",
+        actorId: u ? u.id : ((_session2 = session) === null || _session2 === void 0 ? void 0 : _session2.userId) || "",
+        actorName: u ? u.name : "",
+        role: u ? u.role : ((_session3 = session) === null || _session3 === void 0 ? void 0 : _session3.role) || "",
+        action,
+        entityType,
+        entityId,
+        meta: safeMeta(meta) });
+
+      saveDBTouch();
+    } catch {
+      // nunca bloquear
+    }
+  }
+
+  /* =======================
+     Debounce simples
+  ======================= */
+  const _deb = {};
+  function debounce(key, ms, fn) {
+    clearTimeout(_deb[key]);
+    _deb[key] = setTimeout(fn, ms);
+  }
+  /* =======================
+   FASE C — RELATORIOS (READ-ONLY)
+   - Nao altera db
+   - Apenas lê e agrega
+   - Prefixo rep_ para nao colidir com o teu codigo
+  ======================= */
+
+  function rep_toDateOnly(d) {
+    if (!d) return null;
+    const s = String(d);
+    return s.length >= 10 ? s.slice(0, 10) : s;
+  }
+
+  function rep_inRange(dateISO, from, to) {
+    const d = rep_toDateOnly(dateISO);
+    if (!d) return false;
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    return true;
+  }
+
+  function rep_safeArr(x) {return Array.isArray(x) ? x : [];}
+
+  function rep_sum(arr, fn) {
+    return rep_safeArr(arr).reduce((a, x) => a + (fn ? Number(fn(x)) || 0 : Number(x) || 0), 0);
+  }
+
+  function rep_groupBy(arr, keyFn) {
+    const m = new Map();
+    for (const it of rep_safeArr(arr)) {
+      const k = keyFn(it);
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(it);
+    }
+    return m;
+  }
+
+  function rep_periodKey(dateISO, period = "day") {
+    const d = new Date(dateISO);
+    if (Number.isNaN(d.getTime())) return null;
+    const y = d.getUTCFullYear();
+    const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const day = String(d.getUTCDate()).padStart(2, "0");
+
+    if (period === "month") return `${y}-${m}`;
+
+    if (period === "week") {
+      const t = new Date(Date.UTC(y, d.getUTCMonth(), d.getUTCDate()));
+      const dow = (t.getUTCDay() + 6) % 7; // Mon=0
+      t.setUTCDate(t.getUTCDate() - dow + 3); // quinta
+      const firstThu = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+      const firstDow = (firstThu.getUTCDay() + 6) % 7;
+      firstThu.setUTCDate(firstThu.getUTCDate() - firstDow + 3);
+      const week = 1 + Math.round((t - firstThu) / (7 * 24 * 3600 * 1000));
+      return `${t.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+    }
+
+    return `${y}-${m}-${day}`; // day
+  }
+
+  function rep_normFilters(f) {
+    const filters = {
+      from: null,
+      to: null,
+      period: "day", // day|week|month
+      userId: null, // actorId (audit) / session user (se quiser no futuro)
+      clientId: null,
+      productId: null,
+      accountId: null,
+      supplier: null,
+      includeCancelled: false,
+      ...(f || {}) };
+
+    filters.from = filters.from ? rep_toDateOnly(filters.from) : null;
+    filters.to = filters.to ? rep_toDateOnly(filters.to) : null;
+    return filters;
+  }
+
+  // ===== Extractors (ajustados ao TEU db real) =====
+  function rep_saleIsCancelled(s) {return (s === null || s === void 0 ? void 0 : s.status) === "cancelled";}
+  function rep_saleDate(s) {return (s === null || s === void 0 ? void 0 : s.date) || (s !== null && s !== void 0 && s.createdAt ? String(s.createdAt).slice(0, 10) : null);}
+  function rep_saleItems(s) {return rep_safeArr(s === null || s === void 0 ? void 0 : s.items);}
+  function rep_saleTotal(s) {return Number((s === null || s === void 0 ? void 0 : s.total) || 0) || 0;}
+
+  function rep_purchaseDate(p) {return (p === null || p === void 0 ? void 0 : p.date) || (p !== null && p !== void 0 && p.createdAt ? String(p.createdAt).slice(0, 10) : null);}
+  function rep_purchaseSupplier(p) {return (p === null || p === void 0 ? void 0 : p.supplier) || "";}
+  function rep_purchaseTotal(p) {return Number((p === null || p === void 0 ? void 0 : p.total) || 0) || 0;}
+
+  function rep_ledgerDate(l) {return (l === null || l === void 0 ? void 0 : l.date) || (l !== null && l !== void 0 && l.createdAt ? String(l.createdAt).slice(0, 10) : null);}
+  function rep_ledgerType(l) {return (l === null || l === void 0 ? void 0 : l.type) || "";} // in|out
+  function rep_ledgerAmount(l) {return Number((l === null || l === void 0 ? void 0 : l.amount) || 0) || 0;}
+  function rep_ledgerAccountId(l) {return (l === null || l === void 0 ? void 0 : l.accountId) || "";}
+
+  function rep_invDate(m) {return (m === null || m === void 0 ? void 0 : m.date) || (m !== null && m !== void 0 && m.createdAt ? String(m.createdAt).slice(0, 10) : null);}
+  function rep_invProductId(m) {return (m === null || m === void 0 ? void 0 : m.productId) || "";}
+  function rep_invDelta(m) {
+    const qty = Number((m === null || m === void 0 ? void 0 : m.qty) || 0) || 0;
+    if ((m === null || m === void 0 ? void 0 : m.type) === "in") return Math.abs(qty);
+    if ((m === null || m === void 0 ? void 0 : m.type) === "out") return -Math.abs(qty);
+    return qty;
+  }
+
+  // ===== R1: Resumo de Vendas =====
+  function rep_salesSummary(filters) {var _db;
+    const f = rep_normFilters(filters);
+    const sales = rep_safeArr((_db = db) === null || _db === void 0 ? void 0 : _db.sales).filter(s => {
+      if (!f.includeCancelled && rep_saleIsCancelled(s)) return false;
+      const d = rep_saleDate(s);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.clientId && (s.clientId || "") !== f.clientId) return false;
+      if (f.accountId && (s.accountId || "") !== f.accountId) return false;
+      if (f.productId) {
+        const has = rep_saleItems(s).some(it => (it.productId || "") === f.productId);
+        if (!has) return false;
       }
+      return true;
+    });
 
-      openModal(
-        "Recuperar PIN",
-        `
-        <form id="recoverForm" class="form2" data-user-id="${u.id}">
-          <div class="field full">
-            <label>Utilizador</label>
-            <input class="input" value="${safeText(u.nome)}" disabled />
-          </div>
+    const totalRevenue = rep_sum(sales, rep_saleTotal);
+    const numSales = sales.length;
+    const itemsSold = rep_sum(sales, s => rep_sum(rep_saleItems(s), it => Number(it.qty || 0) || 0));
+    const avgTicket = numSales ? totalRevenue / numSales : 0;
 
-          <div class="field full">
-            <label>Pergunta</label>
-            <input class="input" value="${safeText(u.securityQuestion)}" disabled />
-          </div>
+    return { totalRevenue, numSales, itemsSold, avgTicket };
+  }
 
-          <div class="field full">
-            <label>Resposta</label>
-            <input class="input" id="recoverAnswer" required placeholder="Digite a resposta..." />
-          </div>
+  // ===== R2: Serie temporal de Vendas =====
+  function rep_salesTimeseries(filters) {var _db2;
+    const f = rep_normFilters(filters);
+    const sales = rep_safeArr((_db2 = db) === null || _db2 === void 0 ? void 0 : _db2.sales).filter(s => {
+      if (!f.includeCancelled && rep_saleIsCancelled(s)) return false;
+      const d = rep_saleDate(s);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.clientId && (s.clientId || "") !== f.clientId) return false;
+      if (f.accountId && (s.accountId || "") !== f.accountId) return false;
+      return true;
+    });
 
-          <div class="field full">
-            <label>Novo PIN (4–8 dígitos)</label>
-            <input class="input" id="recoverNewPin" type="password" inputmode="numeric" required placeholder="ex: 1234" />
-          </div>
+    const buckets = rep_groupBy(sales, s => rep_periodKey(s.createdAt || s.date || "", f.period));
+    const points = [];
+    for (const [k, arr] of buckets.entries()) {
+      if (!k) continue;
+      points.push({
+        period: k,
+        revenue: rep_sum(arr, rep_saleTotal),
+        numSales: arr.length,
+        items: rep_sum(arr, s => rep_sum(rep_saleItems(s), it => Number(it.qty || 0) || 0)) });
 
-          <button class="btn big full" type="submit">Atualizar PIN</button>
-        </form>
-        `
-      );
+    }
+    points.sort((a, b) => String(a.period).localeCompare(String(b.period)));
+    return points;
+  }
+
+  // ===== R3: Vendas por Produto =====
+  function rep_salesByProduct(filters) {var _db3, _db4;
+    const f = rep_normFilters(filters);
+    const sales = rep_safeArr((_db3 = db) === null || _db3 === void 0 ? void 0 : _db3.sales).filter(s => {
+      if (!f.includeCancelled && rep_saleIsCancelled(s)) return false;
+      const d = rep_saleDate(s);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.clientId && (s.clientId || "") !== f.clientId) return false;
+      if (f.accountId && (s.accountId || "") !== f.accountId) return false;
+      return true;
+    });
+
+    const map = new Map();
+    for (const s of sales) {
+      for (const it of rep_saleItems(s)) {
+        const pid = it.productId || "";
+        if (!pid) continue;
+        if (f.productId && pid !== f.productId) continue;
+
+        const qty = Number(it.qty || 0) || 0;
+        const price = Number(it.price || 0) || 0;
+        const revenue = qty * price;
+
+        if (!map.has(pid)) map.set(pid, { productId: pid, productName: "", qty: 0, revenue: 0 });
+        const a = map.get(pid);
+        a.qty += qty;
+        a.revenue += revenue;
+      }
+    }
+
+    const pMap = new Map(rep_safeArr((_db4 = db) === null || _db4 === void 0 ? void 0 : _db4.products).map(p => [p.id, p]));
+    const rows = Array.from(map.values()).map(r => {var _pMap$get;return {
+        ...r,
+        productName: ((_pMap$get = pMap.get(r.productId)) === null || _pMap$get === void 0 ? void 0 : _pMap$get.name) || "" };});
+
+
+    const grand = rep_sum(rows, r => r.revenue) || 0;
+    rows.forEach(r => r.share = grand ? r.revenue / grand : 0);
+    rows.sort((a, b) => b.revenue - a.revenue);
+    return rows;
+  }
+
+  // ===== R4: Vendas por Cliente =====
+  function rep_salesByClient(filters) {var _db5, _db6;
+    const f = rep_normFilters(filters);
+    const sales = rep_safeArr((_db5 = db) === null || _db5 === void 0 ? void 0 : _db5.sales).filter(s => {
+      if (!f.includeCancelled && rep_saleIsCancelled(s)) return false;
+      const d = rep_saleDate(s);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.clientId && (s.clientId || "") !== f.clientId) return false;
+      return true;
+    });
+
+    const map = new Map();
+    for (const s of sales) {
+      const cid = s.clientId || "SEM_CLIENTE";
+      if (f.clientId && cid !== f.clientId) continue;
+      if (!map.has(cid)) map.set(cid, { clientId: cid, clientName: "", revenue: 0, numSales: 0, avgTicket: 0 });
+      const a = map.get(cid);
+      a.revenue += rep_saleTotal(s);
+      a.numSales += 1;
+    }
+
+    const cMap = new Map(rep_safeArr((_db6 = db) === null || _db6 === void 0 ? void 0 : _db6.clients).map(c => [c.id, c]));
+    const rows = Array.from(map.values()).map(r => {var _cMap$get;return {
+        ...r,
+        clientName: r.clientId === "SEM_CLIENTE" ? "Sem cliente" : ((_cMap$get = cMap.get(r.clientId)) === null || _cMap$get === void 0 ? void 0 : _cMap$get.name) || "",
+        avgTicket: r.numSales ? r.revenue / r.numSales : 0 };});
+
+
+    rows.sort((a, b) => b.revenue - a.revenue);
+    return rows;
+  }
+
+  // ===== R5: Compras resumo =====
+  function rep_purchasesSummary(filters) {var _db7;
+    const f = rep_normFilters(filters);
+    const purchases = rep_safeArr((_db7 = db) === null || _db7 === void 0 ? void 0 : _db7.purchases).filter(p => {
+      const d = rep_purchaseDate(p);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.supplier && rep_purchaseSupplier(p) !== f.supplier) return false;
+      if (f.accountId && (p.accountId || "") !== f.accountId) return false;
+      return true;
+    });
+
+    const totalSpent = rep_sum(purchases, rep_purchaseTotal);
+    const numPurchases = purchases.length;
+    const itemsBought = rep_sum(purchases, p => rep_sum(rep_safeArr(p.items), it => Number(it.qty || 0) || 0));
+
+    return { totalSpent, numPurchases, itemsBought };
+  }
+
+  // ===== R6: Compras por fornecedor =====
+  function rep_purchasesBySupplier(filters) {var _db8;
+    const f = rep_normFilters(filters);
+    const purchases = rep_safeArr((_db8 = db) === null || _db8 === void 0 ? void 0 : _db8.purchases).filter(p => {
+      const d = rep_purchaseDate(p);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      return true;
+    });
+
+    const map = new Map();
+    for (const p of purchases) {
+      const sup = rep_purchaseSupplier(p) || "SEM_FORNECEDOR";
+      if (f.supplier && sup !== f.supplier) continue;
+      if (!map.has(sup)) map.set(sup, { supplier: sup, spent: 0, numPurchases: 0 });
+      const a = map.get(sup);
+      a.spent += rep_purchaseTotal(p);
+      a.numPurchases += 1;
+    }
+
+    const rows = Array.from(map.values());
+    rows.sort((a, b) => b.spent - a.spent);
+    return rows;
+  }
+
+  // ===== R7: Fluxo de Caixa (ledger) =====
+  function rep_cashflow(filters) {var _db9;
+    const f = rep_normFilters(filters);
+    const led = rep_safeArr((_db9 = db) === null || _db9 === void 0 ? void 0 : _db9.ledger).filter(l => {
+      const d = rep_ledgerDate(l);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.accountId && rep_ledgerAccountId(l) !== f.accountId) return false;
+      return true;
+    });
+
+    const buckets = rep_groupBy(led, l => rep_periodKey(l.createdAt || l.date || "", f.period));
+    const points = [];
+    for (const [k, arr] of buckets.entries()) {
+      if (!k) continue;
+      const inflow = rep_sum(arr.filter(x => rep_ledgerType(x) === "in"), rep_ledgerAmount);
+      const outflow = rep_sum(arr.filter(x => rep_ledgerType(x) === "out"), rep_ledgerAmount);
+      points.push({ period: k, inflow, outflow, net: inflow - outflow });
+    }
+    points.sort((a, b) => String(a.period).localeCompare(String(b.period)));
+    return points;
+  }
+
+  // ===== R8: Saldos por conta (via ledger) =====
+  function rep_accountBalances(filters) {var _db10, _db11;
+    const f = rep_normFilters(filters);
+    const accounts = rep_safeArr((_db10 = db) === null || _db10 === void 0 ? void 0 : _db10.accounts).filter(a => a.active !== false);
+    const led = rep_safeArr((_db11 = db) === null || _db11 === void 0 ? void 0 : _db11.ledger);
+
+    const rows = accounts.map(acc => {
+      const accId = acc.id;
+      const ledAll = led.filter(l => rep_ledgerAccountId(l) === accId);
+
+      const ledPeriod = ledAll.filter(l => {
+        const d = rep_ledgerDate(l);
+        return !f.from && !f.to ? true : rep_inRange(d, f.from, f.to);
+      });
+
+      const inflowAll = rep_sum(ledAll.filter(x => rep_ledgerType(x) === "in"), rep_ledgerAmount);
+      const outflowAll = rep_sum(ledAll.filter(x => rep_ledgerType(x) === "out"), rep_ledgerAmount);
+      const balance = (Number(acc.initialBalance || 0) || 0) + inflowAll - outflowAll;
+
+      const inflowP = rep_sum(ledPeriod.filter(x => rep_ledgerType(x) === "in"), rep_ledgerAmount);
+      const outflowP = rep_sum(ledPeriod.filter(x => rep_ledgerType(x) === "out"), rep_ledgerAmount);
+      const netPeriod = inflowP - outflowP;
+
+      return { accountId: accId, accountName: acc.name || "", balance, netPeriod };
+    });
+
+    rows.sort((a, b) => b.balance - a.balance);
+    return rows;
+  }
+
+  // ===== R9: Inventario atual (produtos) + alertas =====
+  function rep_inventoryStatus() {var _db12;
+    const products = rep_safeArr((_db12 = db) === null || _db12 === void 0 ? void 0 : _db12.products).filter(p => p.active !== false);
+    const rows = products.map(p => {
+      const stock = Number(p.stock || 0) || 0;
+      const minStock = Number(p.stockMin || 0) || 0;
+      const low = !p.stockBaseId && minStock > 0 ? stock <= minStock : false;
+      return { productId: p.id, productName: p.name || "", stock, minStock, low, isPackage: !!p.stockBaseId };
+    });
+
+    rows.sort((a, b) => a.low === b.low ? a.stock - b.stock : a.low ? -1 : 1);
+    return rows;
+  }
+
+  // ===== R10: Movimentos de inventario (timeseries) =====
+  function rep_inventoryMovements(filters) {var _db13;
+    const f = rep_normFilters(filters);
+    const inv = rep_safeArr((_db13 = db) === null || _db13 === void 0 ? void 0 : _db13.inventory).filter(m => {
+      const d = rep_invDate(m);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.productId && rep_invProductId(m) !== f.productId) return false;
+      return true;
+    });
+
+    const buckets = rep_groupBy(inv, m => rep_periodKey(m.createdAt || m.date || "", f.period));
+    const points = [];
+    for (const [k, arr] of buckets.entries()) {
+      if (!k) continue;
+      const delta = rep_sum(arr, rep_invDelta);
+      const inQty = rep_sum(arr.filter(x => rep_invDelta(x) > 0), x => rep_invDelta(x));
+      const outQty = Math.abs(rep_sum(arr.filter(x => rep_invDelta(x) < 0), x => rep_invDelta(x)));
+      points.push({ period: k, inQty, outQty, netDelta: delta });
+    }
+
+    points.sort((a, b) => String(a.period).localeCompare(String(b.period)));
+    return points;
+  }
+
+  // ===== R11: Auditoria (contagens) =====
+  function rep_auditSummary(filters) {var _db14;
+    const f = rep_normFilters(filters);
+    const aud = rep_safeArr((_db14 = db) === null || _db14 === void 0 ? void 0 : _db14.audit).filter(r => {
+      const d = (r.ts || "").slice(0, 10);
+      if (f.from || f.to) if (!rep_inRange(d, f.from, f.to)) return false;
+      if (f.userId && (r.actorId || "") !== f.userId) return false;
+      return true;
+    });
+
+    const byAction = [];
+    for (const [action, arr] of rep_groupBy(aud, x => x.action || "unknown").entries()) {
+      byAction.push({ action, count: arr.length });
+    }
+    byAction.sort((a, b) => b.count - a.count);
+
+    const byUser = [];
+    for (const [uid0, arr] of rep_groupBy(aud, x => x.actorId || "SEM_USER").entries()) {
+      const name = arr[0] && (arr[0].actorName || "") || "";
+      byUser.push({ userId: uid0, userName: name, count: arr.length });
+    }
+    byUser.sort((a, b) => b.count - a.count);
+
+    return { total: aud.length, byAction, byUser };
+  }
+
+  // ===== R12: Resumo geral (facade) =====
+  function rep_all(filters) {
+    return {
+      salesSummary: rep_salesSummary(filters),
+      salesTimeseries: rep_salesTimeseries(filters),
+      salesByProduct: rep_salesByProduct(filters),
+      salesByClient: rep_salesByClient(filters),
+      purchasesSummary: rep_purchasesSummary(filters),
+      purchasesBySupplier: rep_purchasesBySupplier(filters),
+      cashflow: rep_cashflow(filters),
+      accountBalances: rep_accountBalances(filters),
+      inventoryStatus: rep_inventoryStatus(),
+      inventoryMovements: rep_inventoryMovements(filters),
+      audit: rep_auditSummary(filters) };
+
+  }
+
+
+  /* =======================
+     Stock helpers
+  ======================= */
+  function applyStockDelta(productId, delta) {
+    const p = (db.products || []).find(x => x.id === productId);
+    if (!p) return;
+    p.stock = Number(p.stock || 0) + Number(delta || 0);
+    if (p.stock < 0) p.stock = 0;
+    p.updatedAt = nowISO();
+  }
+
+  // inventário manual
+  function inventoryAdjust({ productId, mode, qty, newStock, note }) {
+    const p = (db.products || []).find(x => x.id === productId && x.active !== false);
+    if (!p) throw new Error("Produto inválido.");
+
+    let delta = 0;
+    if (mode === "in") delta = Math.abs(Number(qty || 0));
+    if (mode === "out") delta = -Math.abs(Number(qty || 0));
+    if (mode === "adjust") delta = Number(newStock || 0) - Number(p.stock || 0);
+
+    if (!Number.isFinite(delta) || delta === 0) throw new Error("Ajuste inválido.");
+
+    applyStockDelta(p.id, delta);
+
+    db.inventory.push({
+      id: uid(),
+      date: todayISO(),
+      createdAt: nowISO(),
+      type: delta >= 0 ? "in" : "out",
+      productId: p.id,
+      qty: Math.abs(delta),
+      note: note || "Ajuste manual",
+      refType: "manual",
+      refId: "" });
+
+
+    saveDBTouch();
+    logAction("inventory.adjust", "product", p.id, { delta, note: note || "" });
+    autoSnapshot("inventory.adjust");
+  }
+
+  /* =======================
+     Elements (Auth + Top)
+  ======================= */
+  const screenAuth = el("screenAuth");
+  const screenMain = el("screenMain");
+
+  const wsInput = el("workspaceId");
+  const wsBadge = el("wsBadge");
+
+  const userSelect = el("userSelect");
+  const pinInput = el("pinInput");
+  const authMsg = el("authMsg");
+
+  const btnLogin = el("btnLogin");
+  const btnCreateFirstAdmin = el("btnCreateFirstAdmin");
+  const btnLogout = el("btnLogout");
+
+  const btnSync = el("btnSync");
+  const btnBackup = el("btnBackup");
+
+  /* =======================
+     Topbar Actions
+  ======================= */
+
+  // BACKUP manual
+  if (btnBackup) {
+    btnBackup.onclick = async () => {
+      try {var _db$online;
+        if (!session) return alert("Faça login primeiro.");
+        if (!((_db$online = db.online) !== null && _db$online !== void 0 && _db$online.enabled)) return alert("Ative o Supabase em Config.");
+
+        await pushSnapshot("manual_backup");
+        logAction("backup.manual", "snapshot", "");
+        alert("Backup criado com sucesso ✅");
+      } catch (e) {
+        alert("Erro no backup: " + ((e === null || e === void 0 ? void 0 : e.message) || e));
+      }
+    };
+  }
+
+  // SYNC REAL (MERGE + PUSH)
+  if (btnSync) {
+    btnSync.onclick = async () => {
+      try {var _db$online2;
+        if (!session) return alert("Faça login primeiro.");
+        if (!((_db$online2 = db.online) !== null && _db$online2 !== void 0 && _db$online2.enabled)) return alert("Ative o Supabase em Config.");
+
+        if (!confirm(
+        "Sync real:\n\n" +
+        "• Junta dados locais + nuvem\n" +
+        "• Não apaga vendas do outro dispositivo\n" +
+        "• Envia o resultado final para a nuvem\n\n" +
+        "Continuar?"))
+        return;
+
+        const latest = await pullLatestSnapshot();
+        if (!latest || !latest.payload) return alert("Nenhum snapshot encontrado na nuvem.");
+
+        const merged = mergeDB(db, latest.payload);
+
+        db = merged;
+        save(DB_KEY, db);
+
+        await pushSnapshot("sync_merge");
+
+        renderPOS();
+        renderProducts();
+        renderClients();
+        renderAccounts();
+        renderLedger();
+        renderInventory();
+        renderSales();
+        renderAudit();
+        renderSettings();
+
+        logAction("sync.merge", "snapshot", "", { remote_created_at: latest.created_at });
+        alert("Sync real concluído ✅");
+      } catch (e) {
+        alert("Erro no Sync: " + ((e === null || e === void 0 ? void 0 : e.message) || e));
+        logAction("sync.error", "", "", { error: String(e) });
+      }
+    };
+  }
+
+
+
+  // Supabase login
+  const sbUrlLogin = el("sbUrlLogin");
+  const sbKeyLogin = el("sbKeyLogin");
+  const btnLoadFromCloud = el("btnLoadFromCloud");
+  const cloudMsg = el("cloudMsg");
+
+  function setAuthMsg(m) {
+    if (authMsg) authMsg.textContent = m || "";
+  }
+  function setCloudMsg(m) {
+    if (cloudMsg) cloudMsg.textContent = m || "";
+  }
+
+  if (wsInput) wsInput.value = workspaceId;
+  if (wsBadge) wsBadge.textContent = `Workspace: ${workspaceId || "—"}`;
+
+  function refreshUsersDropdown() {
+    if (!userSelect) return;
+    userSelect.innerHTML = "";
+
+    const users = (db.users || []).filter(u => u.active !== false);
+
+    // MODO BOOTSTRAP: loja nova
+    if (!users.length) {
+      const o = document.createElement("option");
+      o.textContent = "— Sem utilizadores (crie o Admin) —";
+      o.value = "";
+      userSelect.appendChild(o);
+
+      if (btnLogin) btnLogin.disabled = true;
+      if (pinInput) pinInput.disabled = true;
+      return;
+    }
+
+    // MODO NORMAL
+    if (btnLogin) btnLogin.disabled = false;
+    if (pinInput) pinInput.disabled = false;
+
+    users.forEach(u => {
+      const o = document.createElement("option");
+      o.value = u.id;
+      o.textContent = `${u.name} (${u.role})`;
+      userSelect.appendChild(o);
     });
   }
 
+  function showAuth() {
+    if (screenAuth) screenAuth.style.display = "grid";
+    if (screenMain) screenMain.style.display = "none";
+    refreshUsersDropdown();
+  }
+
+  function showMain() {
+    if (screenAuth) screenAuth.style.display = "none";
+    if (screenMain) screenMain.style.display = "grid";
+    if (wsBadge) wsBadge.textContent = `Workspace: ${workspaceId || "—"}`;
+  }
+
+  // Workspace
+  if (wsInput) {
+    wsInput.addEventListener("change", () => {
+      workspaceId = (wsInput.value || "").trim();
+      localStorage.setItem(WS_KEY, workspaceId);
+      if (wsBadge) wsBadge.textContent = `Workspace: ${workspaceId || "—"}`;
+    });
+  }
+
+  // Criar primeiro Admin + conta Caixa
+  if (btnCreateFirstAdmin) {
+    btnCreateFirstAdmin.addEventListener("click", () => {
+      const ws = (wsInput ? wsInput.value : "").trim();
+      if (!ws) return setAuthMsg("Digite o Workspace ID.");
+      if ((db.users || []).length) return setAuthMsg("Já existem utilizadores.");
+
+      const admin = {
+        id: uid(),
+        name: "Admin",
+        role: "admin",
+        pin: "1234",
+        active: true,
+        createdAt: nowISO(),
+        updatedAt: nowISO() };
+
+      db.users.push(admin);
+
+      db.accounts.push({
+        id: uid(),
+        active: true,
+        name: "Caixa",
+        initialBalance: 0,
+        balance: 0,
+        createdAt: nowISO(),
+        updatedAt: nowISO() });
+
+
+      saveDBTouch();
+      refreshUsersDropdown();
+      setAuthMsg("Admin criado. PIN: 1234");
+      logAction("user.create_first_admin", "user", admin.id, {});
+      autoSnapshot("user.create_first_admin");
+    });
+  }
+
+  // Login / Logout
   if (btnLogin) {
     btnLogin.addEventListener("click", () => {
-      const nome = document.getElementById("loginUser")?.value || "";
-      const pin = document.getElementById("loginPin")?.value || "";
-      const res = login(nome, pin);
-      if (!res.ok) return alert("PIN ou utilizador incorreto.");
+      const ws = (wsInput ? wsInput.value : "").trim();
+      if (!ws) return setAuthMsg("Workspace obrigatório.");
 
-      const lp = document.getElementById("loginPin");
-      if (lp) lp.value = "";
+      const userId = userSelect ? userSelect.value : "";
+      const pin = (pinInput ? pinInput.value : "").trim();
 
-      hideAuthScreen();
-      setAppLocked(false);
-      renderAll();
+      const user = (db.users || []).find(u => u.id === userId && u.active !== false);
+      if (!user) return setAuthMsg("Utilizador inválido.");
+      if (pin !== user.pin) return setAuthMsg("PIN incorreto.");
 
-      if (res.mustChangePin) {
-        modalChangePinForced();
+      workspaceId = ws;
+      localStorage.setItem(WS_KEY, ws);
+
+      session = { userId: user.id, role: user.role, loginAt: nowISO() };
+      save(SESSION_KEY, session);
+
+      if (pinInput) pinInput.value = "";
+      setAuthMsg("");
+
+      showMain();
+      initNav();
+      openView("pos");
+
+      logAction("auth.login", "user", user.id, { role: user.role });
+    });
+  }
+
+  if (btnLogout) {
+    btnLogout.addEventListener("click", () => {
+      const u = getSessionUser();
+      logAction("auth.logout", "user", u ? u.id : "", {});
+      session = null;
+      save(SESSION_KEY, null);
+      showAuth();
+    });
+  }
+
+  /* =======================
+     Navigation
+  ======================= */
+  function openView(viewKey) {
+    const views = document.querySelectorAll(".view");
+    for (let i = 0; i < views.length; i++) views[i].style.display = "none";
+
+    const target = el(`view-${viewKey}`);
+    if (target) target.style.display = "block";
+
+    try {
+      if (viewKey === "pos") renderPOS();
+      if (viewKey === "products") renderProducts();
+      if (viewKey === "clients") renderClients();
+      if (viewKey === "accounts") {
+        renderAccounts();
+        renderLedger();
       }
-    });
-  }
-
-  if (btnRegister) {
-    btnRegister.addEventListener("click", () => {
-      try {
-        const nome = document.getElementById("regName")?.value || "";
-        const pin = document.getElementById("regPin")?.value || "";
-
-        const first = db.users.length === 0;
-        const role = first ? "admin" : (document.getElementById("regRole")?.value || "staff");
-
-        if (!first && !isAdmin()) return alert("Só ADMIN pode criar novos utilizadores.");
-
-        const u = createUser({ nome, pin, role });
-        setLoggedInUser(u.id);
-
-        const rn = document.getElementById("regName");
-        const rp = document.getElementById("regPin");
-        if (rn) rn.value = "";
-        if (rp) rp.value = "";
-
-        hideAuthScreen();
-        setAppLocked(false);
-        refreshLoginUsers();
-        renderAll();
-
-        openModal(
-          "Definir recuperação de PIN (recomendado)",
-          `
-          <form id="qaForm" class="form2" data-qa-id="${u.id}">
-            <div class="field full">
-              <label>Pergunta de segurança</label>
-              <input class="input" id="qaQuestion" required placeholder="Ex: Qual é o nome da sua mãe?" />
-            </div>
-
-            <div class="field full">
-              <label>Resposta</label>
-              <input class="input" id="qaAnswer" required placeholder="Ex: Maria" />
-            </div>
-
-            <button class="btn big full" type="submit">Guardar</button>
-            <button class="btn ghost full" type="button" id="skipQA" style="margin-top:8px">Pular</button>
-          </form>
-          `
-        );
-
-        document.getElementById("skipQA")?.addEventListener("click", closeModal);
-
-      } catch (err) {
-        alert(err?.message || "Erro ao criar utilizador.");
+      if (viewKey === "purchases") {
+        resetPurchaseForm();
+        renderPurchases();
       }
-    });
+      if (viewKey === "stock") renderStockView();
+      if (viewKey === "audit") renderAudit();
+      if (viewKey === "settings") {
+        renderSettings();
+        renderUsersManagement(); // ✅ chama a gestão de utilizadores
+      }
+
+      if (viewKey === "reports") renderReports();
+    } catch (e) {
+      console.error(e);
+      alert(e.message || e);
+    }
   }
+  // ✅ FECHA openView AQUI
 
-  const btnSendIssue = document.getElementById("btnSendIssue");
-  if (btnSendIssue) {
-    btnSendIssue.addEventListener("click", () => {
-      const t = document.getElementById("issueText")?.value?.trim() || "";
-      if (!t) return alert("Escreva a descrição do problema.");
-      const it = document.getElementById("issueText");
-      const is = document.getElementById("issueSent");
-      if (it) it.value = "";
-      if (is) is.textContent = "Obrigado! Problema registrado (nesta V1 fica local).";
-    });
-  }
+  /* =======================
+     Reports UI (Fase C)
+  ======================= */
+  /* =======================
+    Reports UI (Fase C) — FIXED
+  ======================= */
+  function renderReports() {
+    const repFrom = el("repFrom");
+    const repTo = el("repTo");
+    const repPeriod = el("repPeriod");
+    const btnRunReports = el("btnRunReports");
 
-  document.addEventListener("click", (e) => {
-    const addBtn = e.target.closest("[data-add]");
-    if (addBtn) return addToCart(addBtn.dataset.add);
+    // Cards principais
+    const repSalesTotal = el("repSalesTotal");
+    const repSalesMeta = el("repSalesMeta");
 
-    const dec = e.target.closest("[data-dec]");
-    if (dec) return changeQty(dec.dataset.dec, -1);
-    const inc = e.target.closest("[data-inc]");
-    if (inc) return changeQty(inc.dataset.inc, +1);
-    const rem = e.target.closest("[data-rem]");
-    if (rem) return removeFromCart(rem.dataset.rem);
+    const repCashNet = el("repCashNet");
+    const repCashMeta = el("repCashMeta");
+    const repCashTable = el("repCashTable");
 
-    const editAcc = e.target.closest("[data-edit-acc]");
-    if (editAcc) return modalAccount(editAcc.dataset.editAcc);
-    const delAcc = e.target.closest("[data-del-acc]");
-    if (delAcc) return deleteAccount(delAcc.dataset.delAcc);
+    const repLowStock = el("repLowStock");
+    const repTopProducts = el("repTopProducts");
 
-    const togProd = e.target.closest("[data-toggle-prod]");
-    if (togProd) {
-      const id = togProd.dataset.toggleProd;
-      db.products = db.products.map((p) => (p.id === id ? { ...p, ativo: !p.ativo } : p));
-      touch();
-      return renderAll();
-    }
-    const delProd = e.target.closest("[data-del-prod]");
-    if (delProd) {
-      if (!guard("products.delete", "Só ADMIN pode apagar produtos.")) return;
-      const id = delProd.dataset.delProd;
-      if (!confirm("Apagar este produto?")) return;
-      db.products = db.products.filter((p) => p.id !== id);
-      if (db.inventory?.[id] != null) delete db.inventory[id];
-      touch();
-      return renderAll();
-    }
+    // Compras
+    const repPurchasesTotal = el("repPurchasesTotal");
+    const repPurchasesMeta = el("repPurchasesMeta");
+    const repPurchasesBySupplier = el("repPurchasesBySupplier");
+    const repPurchasesSummary = el("repPurchasesSummary");
 
-    const delCust = e.target.closest("[data-del-cust]");
-    if (delCust) {
-      const id = delCust.dataset.delCust;
-      if (!confirm("Apagar cliente?")) return;
-      const base = db.customers[0]?.id;
-      if (id === base) return alert("Não pode apagar o cliente balcão.");
-      db.customers = db.customers.filter((c) => c.id !== id);
-      touch();
-      return renderAll();
-    }
+    // Vendas por cliente
+    const repSalesByClientEl = el("repSalesByClient");
 
-    const addUser = e.target.closest("#btnAddUser");
-    if (addUser) return modalUser(null);
+    // Novos blocos
+    const repAccountBalancesEl = el("repAccountBalances");
+    const repInventoryMovementsEl = el("repInventoryMovements");
+    const repAuditSummaryEl = el("repAuditSummary");
 
-    const uEdit = e.target.closest("[data-user-edit]");
-    if (uEdit) return modalUser(uEdit.dataset.userEdit);
+    // defaults seguros
+    if (repFrom && !repFrom.value) repFrom.value = todayISO().slice(0, 8) + "01";
+    if (repTo && !repTo.value) repTo.value = todayISO();
 
-    const uPin = e.target.closest("[data-user-pin]");
-    if (uPin) {
-      if (!isAdmin()) return alert("Só ADMIN pode resetar PIN.");
-      const id = uPin.dataset.userPin;
-      const u = db.users.find((x) => x.id === id);
-      if (!u) return;
-
-      openModal(
-        "Reset PIN (Admin)",
-        `
-          <form id="pinForm" class="form2" data-pin-id="${id}">
-            <div class="field full">
-              <label>Utilizador</label>
-              <input class="input" value="${safeText(u.nome)}" disabled />
-            </div>
-            <div class="field full">
-              <label>PIN temporário (4–8 dígitos)</label>
-              <input class="input" id="newPin" type="password" inputmode="numeric" placeholder="ex: 1234" required />
-            </div>
-            <button class="btn big full" type="submit">Guardar PIN</button>
-          </form>
-          <p class="muted" style="margin-top:8px">O utilizador será obrigado a alterar ao entrar.</p>
-        `
-      );
-      return;
-    }
-
-    const uQA = e.target.closest("[data-user-qa]");
-    if (uQA) return modalSetQA(uQA.dataset.userQa);
-
-    const uToggle = e.target.closest("[data-user-toggle]");
-    if (uToggle) {
-      if (!isAdmin()) return alert("Só ADMIN pode ativar/desativar.");
-      const id = uToggle.dataset.userToggle;
-      const me = currentUser();
-      if (me && me.id === id) return alert("Você não pode desativar o seu próprio utilizador.");
-      db.users = db.users.map((u) => (u.id === id ? { ...u, ativo: u.ativo === false ? true : false } : u));
-      touch();
-      return renderAll();
-    }
-  });
-
-  document.addEventListener("submit", (e) => {
-    const accForm = e.target.closest("#accForm");
-    if (accForm) {
-      e.preventDefault();
-      if (!guard("accounts.create_edit", "Apenas Admin/Gestão podem criar/editar contas.")) return;
-
-      const editId = accForm.getAttribute("data-edit-id");
-      const nome = (document.getElementById("accName")?.value || "").trim();
-      if (!nome) return alert("Escreva o nome da conta.");
-
-      const obj = {
-        id: editId || uid(),
-        nome,
-        tipo: document.getElementById("accType")?.value || "Dinheiro",
-        saldo: Number(document.getElementById("accSaldo")?.value || 0),
-        ativo: (document.getElementById("accActive")?.value || "true") === "true",
-      };
-
-      if (editId) db.accounts = db.accounts.map((x) => (x.id === editId ? obj : x));
-      else db.accounts.push(obj);
-
-      touch();
-      closeModal();
-      renderAll();
-      return;
-    }
-
-    const productForm = e.target.closest("#productForm");
-    if (productForm) {
-      e.preventDefault();
-      if (!guard("products.create", "Apenas Admin/Gestão podem criar produtos.")) return;
-
-      const nome = (document.getElementById("prodName")?.value || "").trim();
-      if (!nome) return alert("Nome do produto é obrigatório.");
-
-      const p = {
-        id: uid(),
-        nome,
-        precoVenda: Number(document.getElementById("prodPrice")?.value || 0),
-        precoAquisicaoRef: Number(document.getElementById("prodCost")?.value || 0),
-        minStock: Number(document.getElementById("prodMinStock")?.value || 0),
-        img: (document.getElementById("prodImg")?.value || "").trim(),
-        desc: (document.getElementById("prodDesc")?.value || "").trim(),
-        ativo: true,
-
-        // ✅ mantém os campos que já tinhas criado
-        stockBaseId: document.getElementById("prodStockBase")?.value || "",
-        stockFactor: Math.max(1, Number(document.getElementById("prodStockFactor")?.value || 1)),
-      };
-
-      db.products.push(p);
-      touch();
-      productForm.reset();
-      const ms = document.getElementById("prodMinStock");
-      if (ms) ms.value = 0;
-      updateProfitNote();
-      renderAll();
-      return;
-    }
-
-    const customerForm = e.target.closest("#customerForm");
-    if (customerForm) {
-      e.preventDefault();
-      const nome = (document.getElementById("custName")?.value || "").trim();
-      if (!nome) return alert("Nome do cliente é obrigatório.");
-
-      const c = {
-        id: uid(),
-        nome,
-        telefone: (document.getElementById("custPhone")?.value || "").trim(),
-        notas: (document.getElementById("custNotes")?.value || "").trim(),
-      };
-      db.customers.push(c);
-      touch();
-      customerForm.reset();
-      renderAll();
-      return;
-    }
-
-    const buyForm = e.target.closest("#buyForm");
-    if (buyForm) {
-      e.preventDefault();
-      if (!guard("purchases.create", "Sem permissão para registrar compras.")) return;
-
-      const supplier = (document.getElementById("buySupplier")?.value || "").trim();
-      const productId = document.getElementById("buyProduct")?.value;
-      const qty = Number(document.getElementById("buyQty")?.value || 0);
-      const costUnit = Number(document.getElementById("buyCost")?.value || 0);
-      const accountId = document.getElementById("buyAccount")?.value;
-      const date = document.getElementById("buyDate")?.value || todayISO();
-
-      if (!supplier) return alert("Informe o fornecedor.");
-      if (!productId) return alert("Selecione o produto.");
-      if (qty <= 0) return alert("Quantidade inválida.");
-      if (costUnit < 0) return alert("Preço inválido.");
-      if (!accountId) return alert("Selecione a conta.");
-
-      const total = qty * costUnit;
-      const purchase = { id: uid(), data: date, supplier, productId, qty, costUnit, total, accountId };
-      db.purchases.push(purchase);
-
-      setInv(productId, invQty(productId) + qty);
-      addLedger({ date, type: "out", accountId, amount: total, refType: "purchase", refId: purchase.id, note: `Compra ${supplier}` });
-
-      db.products = db.products.map((p) => (p.id === productId ? { ...p, precoAquisicaoRef: costUnit } : p));
-
-      touch();
-      buyForm.reset();
-      const bd = document.getElementById("buyDate");
-      const bq = document.getElementById("buyQty");
-      if (bd) bd.value = todayISO();
-      if (bq) bq.value = 1;
-      renderAll();
-      return;
-    }
-
-    const userForm = e.target.closest("#userForm");
-    if (userForm) {
-      e.preventDefault();
-      if (!isAdmin()) return alert("Só ADMIN pode criar/editar.");
-
-      const editId = userForm.getAttribute("data-edit-id");
-      const nome = (document.getElementById("uName")?.value || "").trim();
-      const pin = (document.getElementById("uPin")?.value || "").trim();
-      const first = db.users.length === 0;
-      const roleVal = first ? "admin" : (document.getElementById("uRole")?.value || "staff");
-
-      if (!nome) return alert("Nome obrigatório.");
-
-      if (!editId) {
-        if (!/^\d{4,8}$/.test(pin)) return alert("PIN deve ter 4–8 dígitos.");
-        createUser({ nome, pin, role: roleVal });
-        closeModal();
-        renderAll();
-        alert("Utilizador criado!");
+    const run = () => {
+      if (!window.GFReports) {
+        alert("Motor de relatórios não encontrado (GFReports).");
         return;
       }
 
-      db.users = db.users.map((u) => {
-        if (u.id !== editId) return u;
-        const next = { ...u, nome, role: roleVal };
-        if (pin) {
-          if (!/^\d{4,8}$/.test(pin)) {
-            alert("PIN deve ter 4–8 dígitos.");
-            return u;
-          }
-          next.pin = pin;
-          next.mustChangePin = false;
+      const filters = {
+        from: repFrom ? repFrom.value : "",
+        to: repTo ? repTo.value : "",
+        period: repPeriod ? repPeriod.value : "month" };
+
+
+      /* ===== Vendas (Resumo) ===== */
+      const s = window.GFReports.salesSummary(filters) || {};
+      if (repSalesTotal) repSalesTotal.textContent = MT(s.totalRevenue || 0);
+      if (repSalesMeta) {
+        repSalesMeta.textContent =
+        `${s.numSales || 0} venda(s) • ${Math.round(s.itemsSold || 0)} item(s) • Ticket: ${MT(s.avgTicket || 0)}`;
+      }
+
+      /* ===== Caixa (Cashflow) ===== */
+      const cash = window.GFReports.cashflow(filters) || [];
+      const net = cash.reduce((a, p) => a + Number(p.net || 0), 0);
+      const inflow = cash.reduce((a, p) => a + Number(p.inflow || 0), 0);
+      const outflow = cash.reduce((a, p) => a + Number(p.outflow || 0), 0);
+
+      if (repCashNet) repCashNet.textContent = MT(net);
+      if (repCashMeta) repCashMeta.textContent = `Entradas: ${MT(inflow)} • Saídas: ${MT(outflow)}`;
+
+      if (repCashTable) {
+        repCashTable.innerHTML = "";
+        if (!cash.length) {
+          repCashTable.innerHTML = `<div class="muted">Sem movimentos no período.</div>`;
+        } else {
+          cash.slice(-12).forEach(p => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div><b>${p.period}</b></div>
+            <div class="mono">
+              +${MT(p.inflow)} &nbsp; -${MT(p.outflow)} &nbsp; = <b>${MT(p.net)}</b>
+            </div>
+          `;
+            repCashTable.appendChild(row);
+          });
         }
-        return next;
+      }
+
+      /* ===== Stock baixo ===== */
+      const inv = window.GFReports.inventoryStatus() || [];
+      const low = inv.filter(x => x.low).length;
+      if (repLowStock) repLowStock.textContent = String(low);
+
+      /* ===== Top produtos ===== */
+      const top = (window.GFReports.salesByProduct(filters) || []).slice(0, 8);
+      if (repTopProducts) {
+        repTopProducts.innerHTML = "";
+        if (!top.length) {
+          repTopProducts.innerHTML = `<div class="muted">Sem dados neste período.</div>`;
+        } else {
+          top.forEach(r => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div>${r.productName || r.productId}</div>
+            <div class="mono">${MT(r.revenue || 0)} <span class="muted">(${Math.round(r.qty || 0)} un.)</span></div>
+          `;
+            repTopProducts.appendChild(row);
+          });
+        }
+      }
+
+      /* ===== Compras (Resumo - cards) ===== */
+      const ps = window.GFReports.purchasesSummary(filters) || {};
+      if (repPurchasesTotal) repPurchasesTotal.textContent = MT(ps.totalSpent || 0);
+      if (repPurchasesMeta) {
+        repPurchasesMeta.textContent = `${ps.numPurchases || 0} compra(s) • ${Math.round(ps.itemsBought || 0)} item(s)`;
+      }
+
+      /* ===== Compras (Resumo - bloco detalhado) ===== */
+      if (repPurchasesSummary) {
+        repPurchasesSummary.innerHTML = `
+        <div class="row between">
+          <div class="muted">Total gasto</div>
+          <div class="mono"><b>${MT(ps.totalSpent || 0)}</b></div>
+        </div>
+        <div class="row between">
+          <div class="muted">Nº de compras</div>
+          <div class="mono"><b>${ps.numPurchases || 0}</b></div>
+        </div>
+        <div class="row between">
+          <div class="muted">Itens comprados</div>
+          <div class="mono"><b>${Math.round(ps.itemsBought || 0)}</b></div>
+        </div>
+      `;
+      }
+
+      /* ===== Compras por Fornecedor ===== */
+      if (repPurchasesBySupplier) {
+        const bySup = (window.GFReports.purchasesBySupplier(filters) || []).slice(0, 10);
+
+        repPurchasesBySupplier.innerHTML = "";
+        if (!bySup.length) {
+          repPurchasesBySupplier.innerHTML = `<div class="muted">Sem dados neste período.</div>`;
+        } else {
+          bySup.forEach(r => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div>${r.supplier || "Sem fornecedor"}</div>
+            <div class="mono"><b>${MT(r.spent || 0)}</b> <span class="muted">(${r.numPurchases || 0})</span></div>
+          `;
+            repPurchasesBySupplier.appendChild(row);
+          });
+        }
+      }
+
+      /* ===== Vendas por Cliente ===== */
+      if (repSalesByClientEl) {
+        const byClient = (window.GFReports.salesByClient(filters) || []).slice(0, 10);
+
+        repSalesByClientEl.innerHTML = "";
+        if (!byClient.length) {
+          repSalesByClientEl.innerHTML = `<div class="muted">Sem dados neste período.</div>`;
+        } else {
+          byClient.forEach(r => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div>${r.clientName || "Sem cliente"}</div>
+            <div class="mono"><b>${MT(r.revenue || 0)}</b> <span class="muted">(${r.numSales || 0} venda(s))</span></div>
+          `;
+            repSalesByClientEl.appendChild(row);
+          });
+        }
+      }
+
+      /* ===== Saldos por Conta ===== */
+      if (repAccountBalancesEl) {
+        const bals = (window.GFReports.accountBalances(filters) || []).slice(0, 20);
+        repAccountBalancesEl.innerHTML = "";
+        if (!bals.length) {
+          repAccountBalancesEl.innerHTML = `<div class="muted">Sem contas / sem movimentos.</div>`;
+        } else {
+          bals.forEach(r => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div>${r.accountName || r.accountId}</div>
+            <div class="mono">
+              <b>${MT(r.balance || 0)}</b>
+              <span class="muted"> (Período: ${MT(r.netPeriod || 0)})</span>
+            </div>
+          `;
+            repAccountBalancesEl.appendChild(row);
+          });
+        }
+      }
+
+      /* ===== Movimentos de Inventário ===== */
+      if (repInventoryMovementsEl) {
+        const mov = (window.GFReports.inventoryMovements(filters) || []).slice(-12);
+        repInventoryMovementsEl.innerHTML = "";
+        if (!mov.length) {
+          repInventoryMovementsEl.innerHTML = `<div class="muted">Sem movimentos no período.</div>`;
+        } else {
+          mov.forEach(p => {
+            const row = document.createElement("div");
+            row.className = "row between";
+            row.innerHTML = `
+            <div><b>${p.period}</b></div>
+            <div class="mono">
+              +${Math.round(p.inQty || 0)} &nbsp; -${Math.round(p.outQty || 0)} &nbsp; = <b>${Math.round(p.netDelta || 0)}</b>
+            </div>
+          `;
+            repInventoryMovementsEl.appendChild(row);
+          });
+        }
+      }
+
+      /* ===== Auditoria (Resumo) ===== */
+      if (repAuditSummaryEl) {
+        const a = window.GFReports.audit(filters) || {};
+        const topActions = (a.byAction || []).slice(0, 5);
+        const topUsers = (a.byUser || []).slice(0, 5);
+
+        repAuditSummaryEl.innerHTML = `
+        <div class="row between">
+          <div class="muted">Total registos</div>
+          <div class="mono"><b>${a.total || 0}</b></div>
+        </div>
+        <hr class="sep" />
+        <div class="muted" style="margin-bottom:6px"><b>Top ações</b></div>
+        ${topActions.length ? topActions.map(x => `
+          <div class="row between">
+            <div>${x.action}</div>
+            <div class="mono"><b>${x.count}</b></div>
+          </div>
+        `).join("") : `<div class="muted">Sem dados.</div>`}
+        <hr class="sep" />
+        <div class="muted" style="margin-bottom:6px"><b>Top utilizadores</b></div>
+        ${topUsers.length ? topUsers.map(x => `
+          <div class="row between">
+            <div>${x.userName || x.userId}</div>
+            <div class="mono"><b>${x.count}</b></div>
+          </div>
+        `).join("") : `<div class="muted">Sem dados.</div>`}
+      `;
+      }
+    };
+
+    if (btnRunReports) btnRunReports.onclick = run;
+    run();
+  }
+
+
+
+  function initNav() {
+    const navs = document.querySelectorAll(".nav");
+    for (let i = 0; i < navs.length; i++) {
+      navs[i].onclick = () => {
+        for (let j = 0; j < navs.length; j++) navs[j].classList.remove("active");
+        navs[i].classList.add("active");
+        openView(navs[i].dataset.view);
+      };
+    }
+    // ===== Mobile bottom nav =====
+    const mnav = document.getElementById("mnav");
+    if (mnav) {
+      const btns = mnav.querySelectorAll(".mnav-btn[data-view]");
+      btns.forEach(b => {
+        b.onclick = () => {
+          btns.forEach(x => x.classList.remove("active"));
+          b.classList.add("active");
+          openView(b.dataset.view);
+        };
+      });
+    }
+
+    // ===== Sheet “Mais” =====
+    const btnMore = document.getElementById("btnMore");
+    const moreSheet = document.getElementById("moreSheet");
+    const btnCloseMore = document.getElementById("btnCloseMore");
+
+    if (btnMore && moreSheet) btnMore.onclick = () => moreSheet.style.display = "block";
+    if (btnCloseMore && moreSheet) btnCloseMore.onclick = () => moreSheet.style.display = "none";
+
+    if (moreSheet) {
+      moreSheet.addEventListener("click", e => {
+        if (e.target === moreSheet) moreSheet.style.display = "none";
       });
 
-      touch();
-      closeModal();
-      renderAll();
-      alert("Utilizador atualizado!");
-      return;
-    }
-
-    const pinForm = e.target.closest("#pinForm");
-    if (pinForm) {
-      e.preventDefault();
-      if (!isAdmin()) return alert("Só ADMIN pode resetar PIN.");
-
-      const id = pinForm.getAttribute("data-pin-id");
-      const newPin = (document.getElementById("newPin")?.value || "").trim();
-      if (!/^\d{4,8}$/.test(newPin)) return alert("PIN deve ter 4–8 dígitos.");
-
-      adminResetPin(id, newPin);
-      closeModal();
-      renderAll();
-      alert("PIN temporário definido!");
-      return;
-    }
-
-    const qaForm = e.target.closest("#qaForm");
-    if (qaForm) {
-      e.preventDefault();
-      const id = qaForm.getAttribute("data-qa-id");
-      const q = document.getElementById("qaQuestion")?.value || "";
-      const a = document.getElementById("qaAnswer")?.value || "";
-      setSecurityQA(id, q, a)
-        .then(() => {
-          closeModal();
-          renderAll();
-          alert("Recuperação definida!");
-        })
-        .catch((err) => alert(err?.message || "Erro ao guardar pergunta."));
-      return;
-    }
-
-    const recoverForm = e.target.closest("#recoverForm");
-    if (recoverForm) {
-      e.preventDefault();
-      const userId = recoverForm.getAttribute("data-user-id");
-      const ans = document.getElementById("recoverAnswer")?.value || "";
-      const newPin = document.getElementById("recoverNewPin")?.value || "";
-      recoverPinByQuestion(userId, ans, newPin).then(() => {
-        closeModal();
-        refreshLoginUsers();
+      moreSheet.querySelectorAll(".sheet-item[data-view]").forEach(b => {
+        b.onclick = () => {
+          moreSheet.style.display = "none";
+          openView(b.dataset.view);
+        };
       });
+    }
+
+  }
+
+  /* =======================
+     Ledger + Accounts
+  ======================= */
+  const btnNewAccount = el("btnNewAccount");
+  const btnRefreshLedger = el("btnRefreshLedger");
+
+  const accFormTitle = el("accFormTitle");
+  const accName = el("accName");
+  const accBalance = el("accBalance");
+  const btnSaveAccount = el("btnSaveAccount");
+  const btnCancelAccEdit = el("btnCancelAccEdit");
+  const accMsg = el("accMsg");
+  const accTable = el("accTable");
+  const accCount = el("accCount");
+
+  const ledgerTable = el("ledgerTable");
+  const ledgerCount = el("ledgerCount");
+  const ledgFrom = el("ledgFrom");
+  const ledgTo = el("ledgTo");
+  const ledgAccountFilter = el("ledgAccountFilter");
+  const ledgTypeFilter = el("ledgTypeFilter");
+  const btnApplyLedgerFilters = el("btnApplyLedgerFilters");
+
+  let editingAccId = null;
+
+  function setAccMsg(m) {
+    if (accMsg) accMsg.textContent = m || "";
+  }
+
+  function resetAccForm() {
+    editingAccId = null;
+    if (accFormTitle) accFormTitle.textContent = "Nova Conta";
+    if (accName) accName.value = "";
+    if (accBalance) accBalance.value = "";
+    if (btnCancelAccEdit) btnCancelAccEdit.style.display = "none";
+    setAccMsg("");
+  }
+
+  function recalcAccountBalancesFromLedger() {
+    const accs = db.accounts || [];
+    accs.forEach(a => {
+      if (a.active === false) return;
+      if (a.initialBalance == null) a.initialBalance = Number(a.balance || 0);
+      a.balance = Number(a.initialBalance || 0);
+    });
+
+    (db.ledger || []).forEach(m => {
+      const acc = accs.find(a => a.id === m.accountId && a.active !== false);
+      if (!acc) return;
+      const amt = Number(m.amount || 0);
+      if (m.type === "in") acc.balance += amt;
+      if (m.type === "out") acc.balance -= amt;
+    });
+
+    saveDBTouch();
+  }
+
+  function addLedger(opts) {
+    const entry = {
+      id: uid(),
+      date: opts.date || todayISO(),
+      type: opts.type, // "in" | "out"
+      accountId: opts.accountId,
+      amount: Number(opts.amount || 0),
+      refType: opts.refType || "",
+      refId: opts.refId || "",
+      note: opts.note || "",
+      createdAt: nowISO(),
+      updatedAt: nowISO() };
+
+
+    db.ledger.push(entry);
+    saveDBTouch();
+    recalcAccountBalancesFromLedger();
+    return entry;
+  }
+
+  function fillLedgerAccountFilter() {
+    if (!ledgAccountFilter) return;
+    ledgAccountFilter.innerHTML = "";
+    const o0 = document.createElement("option");
+    o0.value = "";
+    o0.textContent = "Todas as contas";
+    ledgAccountFilter.appendChild(o0);
+
+    (db.accounts || []).
+    filter(a => a.active !== false).
+    forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = a.name;
+      ledgAccountFilter.appendChild(o);
+    });
+  }
+
+  function renderAccounts() {
+    if (!accTable) return;
+
+    if (!db.accounts.some(a => a.active !== false)) {
+      db.accounts.push({
+        id: uid(),
+        active: true,
+        name: "Caixa",
+        initialBalance: 0,
+        balance: 0,
+        createdAt: nowISO(),
+        updatedAt: nowISO() });
+
+      saveDBTouch();
+    }
+
+    recalcAccountBalancesFromLedger();
+    fillLedgerAccountFilter();
+    fillPosAccounts();
+    fillPurchaseAccounts();
+    fillSalesAccountFilter();
+
+    const list = db.accounts.
+    filter(a => a.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    accTable.innerHTML = "";
+
+    list.forEach(a => {
+      const row = document.createElement("div");
+      row.className = "rowitem";
+      row.innerHTML = `
+        <div>
+          <div><b>${a.name}</b></div>
+          <div class="muted">Saldo: <span class="mono">${MT(a.balance || 0)}</span></div>
+        </div>
+        <div class="muted">Inicial: ${MT(a.initialBalance || 0)}</div>
+        <div class="muted">—</div>
+        <div><span class="badge">Ativa</span></div>
+        <div class="actions">
+          <button class="btn iconbtn" data-act="edit">Editar</button>
+          <button class="btn danger iconbtn" data-act="del">Apagar</button>
+        </div>
+      `;
+
+      row.querySelector('[data-act="edit"]').onclick = () => {var _ref, _a$initialBalance;
+        if (!canManage()) return alert("Sem permissão.");
+        editingAccId = a.id;
+        if (accFormTitle) accFormTitle.textContent = "Editar Conta";
+        if (accName) accName.value = a.name || "";
+        if (accBalance) accBalance.value = String((_ref = (_a$initialBalance = a.initialBalance) !== null && _a$initialBalance !== void 0 ? _a$initialBalance : a.balance) !== null && _ref !== void 0 ? _ref : 0);
+        if (btnCancelAccEdit) btnCancelAccEdit.style.display = "block";
+        setAccMsg("");
+      };
+
+      row.querySelector('[data-act="del"]').onclick = () => {
+        if (!canManage()) return;
+        alert("Sem permissão.");
+        if (!confirm("Apagar conta? (será desativada)")) return;
+        a.active = false;
+        a.updatedAt = nowISO();
+        saveDBTouch();
+        if (editingAccId === a.id) resetAccForm();
+        renderAccounts();
+        renderLedger();
+        logAction("account.deactivate", "account", a.id, { name: a.name });
+        autoSnapshot("account.deactivate");
+      };
+
+      accTable.appendChild(row);
+    });
+
+    if (accCount) accCount.textContent = `${list.length} conta(s)`;
+  }
+
+  if (btnNewAccount) btnNewAccount.onclick = () => {
+    if (!canManage()) return alert("Sem permissão.");
+    resetAccForm();
+  };
+  if (btnCancelAccEdit) btnCancelAccEdit.onclick = resetAccForm;
+
+  if (btnSaveAccount) {
+    btnSaveAccount.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+
+      const name = (accName ? accName.value : "").trim();
+      if (!name) return setAccMsg("Nome da conta é obrigatório.");
+
+      const initial = nnum(accBalance ? accBalance.value : "", 0);
+      if (!Number.isFinite(initial)) return setAccMsg("Saldo inválido.");
+
+      if (!editingAccId) {
+        const a = {
+          id: uid(),
+          active: true,
+          name,
+          initialBalance: initial,
+          balance: initial,
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+        db.accounts.push(a);
+        logAction("account.create", "account", a.id, { name: a.name });
+        autoSnapshot("account.create");
+      } else {
+        const a = db.accounts.find(x => x.id === editingAccId);
+        if (!a) return setAccMsg("Conta não encontrada.");
+        a.name = name;
+        a.initialBalance = initial;
+        a.updatedAt = nowISO();
+        logAction("account.update", "account", a.id, { name: a.name });
+        autoSnapshot("account.update");
+      }
+
+      saveDBTouch();
+      resetAccForm();
+      renderAccounts();
+      renderLedger();
+    };
+  }
+
+  function renderLedger() {
+    if (!ledgerTable) return;
+
+    fillLedgerAccountFilter();
+
+    const from = ledgFrom ? ledgFrom.value : "";
+    const to = ledgTo ? ledgTo.value : "";
+    const accId = ledgAccountFilter ? ledgAccountFilter.value : "";
+    const type = ledgTypeFilter ? ledgTypeFilter.value : "";
+
+    const rows = db.ledger.
+    filter(m => !from || m.date >= from).
+    filter(m => !to || m.date <= to).
+    filter(m => !accId || m.accountId === accId).
+    filter(m => !type || m.type === type).
+    sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+
+    ledgerTable.innerHTML = "";
+
+    rows.forEach(m => {
+      const acc = (db.accounts || []).find(a => a.id === m.accountId) || { name: "—" };
+      const row = document.createElement("div");
+      row.className = "rowitem ledger";
+      row.innerHTML = `
+        <div>
+          <div><b>${m.date || "—"}</b> <span class="badge">${m.type === "in" ? "Entrada" : "Saída"}</span></div>
+          <div class="muted">${m.note || ""}</div>
+        </div>
+        <div class="mono">${MT(m.amount || 0)}</div>
+        <div class="muted">${acc.name}</div>
+        <div class="muted">${m.refType ? `${m.refType}#${String(m.refId || "").slice(0, 6)}` : "—"}</div>
+      `;
+      ledgerTable.appendChild(row);
+    });
+
+    if (ledgerCount) ledgerCount.textContent = `${rows.length} movimento(s)`;
+  }
+
+  if (btnApplyLedgerFilters) btnApplyLedgerFilters.onclick = renderLedger;
+  if (btnRefreshLedger) btnRefreshLedger.onclick = () => {renderAccounts();renderLedger();};
+
+  /* =======================
+     Products (CRUD + Stock Base)
+  ======================= */
+  let editingProductId = null;
+
+  const prodSearch = el("prodSearch");
+  const btnNewProduct = el("btnNewProduct");
+  const prodTable = el("prodTable");
+  const prodCount = el("prodCount");
+
+  const prodFormTitle = el("prodFormTitle");
+  const prodName = el("prodName");
+  const prodPrice = el("prodPrice");
+  const prodCost = el("prodCost");
+  const prodStock = el("prodStock");
+  const prodStockMin = el("prodStockMin");
+  const prodDesc = el("prodDesc");
+
+  const prodStockBase = el("prodStockBase");
+  const prodStockFactor = el("prodStockFactor");
+
+  const btnSaveProduct = el("btnSaveProduct");
+  const btnCancelEdit = el("btnCancelEdit");
+  const prodMsg = el("prodMsg");
+
+  function setProdMsg(m) {if (prodMsg) prodMsg.textContent = m || "";}
+
+  function fillStockBaseOptions() {
+    if (!prodStockBase) return;
+    prodStockBase.innerHTML = "";
+    const opt0 = document.createElement("option");
+    opt0.value = "";
+    opt0.textContent = "— Nenhum —";
+    prodStockBase.appendChild(opt0);
+
+    (db.products || []).
+    filter(p => p.active !== false).
+    forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = p.name;
+      prodStockBase.appendChild(o);
+    });
+  }
+
+  function resetProductForm() {
+    editingProductId = null;
+    if (prodFormTitle) prodFormTitle.textContent = "Novo Produto";
+    if (prodName) prodName.value = "";
+    if (prodPrice) prodPrice.value = "";
+    if (prodCost) prodCost.value = "";
+    if (prodStock) prodStock.value = "";
+    if (prodStockMin) prodStockMin.value = "";
+    if (prodDesc) prodDesc.value = "";
+    if (prodStockBase) prodStockBase.value = "";
+    if (prodStockFactor) prodStockFactor.value = "";
+    if (btnCancelEdit) btnCancelEdit.style.display = "none";
+    setProdMsg("");
+  }
+
+  function loadProductToForm(p) {var _p$price, _p$cost, _p$stock, _p$stockMin, _p$stockFactor;
+    editingProductId = p.id;
+    if (prodFormTitle) prodFormTitle.textContent = "Editar Produto";
+    if (prodName) prodName.value = p.name || "";
+    if (prodPrice) prodPrice.value = String((_p$price = p.price) !== null && _p$price !== void 0 ? _p$price : "");
+    if (prodCost) prodCost.value = String((_p$cost = p.cost) !== null && _p$cost !== void 0 ? _p$cost : "");
+    if (prodStock) prodStock.value = String((_p$stock = p.stock) !== null && _p$stock !== void 0 ? _p$stock : 0);
+    if (prodStockMin) prodStockMin.value = String((_p$stockMin = p.stockMin) !== null && _p$stockMin !== void 0 ? _p$stockMin : 0);
+    if (prodDesc) prodDesc.value = p.desc || "";
+    if (prodStockBase) prodStockBase.value = p.stockBaseId || "";
+    if (prodStockFactor) prodStockFactor.value = String((_p$stockFactor = p.stockFactor) !== null && _p$stockFactor !== void 0 ? _p$stockFactor : "");
+    if (btnCancelEdit) btnCancelEdit.style.display = "block";
+    setProdMsg("");
+  }
+
+  function renderProducts() {
+    if (!prodTable) return;
+
+    fillStockBaseOptions();
+
+    const q = (prodSearch ? prodSearch.value : "").toLowerCase().trim();
+    const list = (db.products || []).
+    filter(p => p.active !== false).
+    filter(p => !q || (p.name || "").toLowerCase().includes(q)).
+    sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    prodTable.innerHTML = "";
+
+    list.forEach(p => {
+      const base = p.stockBaseId ? (db.products || []).find(x => x.id === p.stockBaseId) : null;
+      const low = Number(p.stock || 0) <= Number(p.stockMin || 0) && !p.stockBaseId;
+
+      const row = document.createElement("div");
+      row.className = "rowitem";
+      row.innerHTML = `
+        <div>
+          <div><b>${p.name || "-"}</b> ${low ? `<span class="badge low" style="margin-left:6px">Baixo stock</span>` : ""}</div>
+          <div class="muted">
+            ${base ? `Consome: <span class="badge">${base.name}</span> × <b>${p.stockFactor || 0}</b>` : "Stock próprio"}
+          </div>
+        </div>
+        <div>${MT(p.price || 0)}</div>
+        <div class="muted">${MT(p.cost || 0)}</div>
+        <div><span class="badge">Stock: <b>${Number(p.stock || 0)}</b></span></div>
+        <div class="actions">
+          <button class="btn iconbtn" data-act="edit">Editar</button>
+          <button class="btn danger iconbtn" data-act="del">Apagar</button>
+        </div>
+      `;
+
+      row.querySelector('[data-act="edit"]').onclick = () => {
+        if (!canManage()) return alert("Sem permissão.");
+        fillStockBaseOptions();
+        loadProductToForm(p);
+      };
+
+      row.querySelector('[data-act="del"]').onclick = () => {
+        if (!canManage()) return alert("Sem permissão.");
+        if (!confirm("Apagar produto? (ele será desativado)")) return;
+        p.active = false;
+        p.updatedAt = nowISO();
+        saveDBTouch();
+        if (editingProductId === p.id) resetProductForm();
+        renderProducts();
+        renderPOS();
+        logAction("product.deactivate", "product", p.id, { name: p.name });
+        autoSnapshot("product.deactivate");
+      };
+
+      prodTable.appendChild(row);
+    });
+
+    if (prodCount) prodCount.textContent = `${list.length} produto(s)`;
+  }
+
+  if (btnNewProduct) btnNewProduct.onclick = () => {
+    if (!canManage()) return alert("Sem permissão.");
+    resetProductForm();
+  };
+  if (btnCancelEdit) btnCancelEdit.onclick = resetProductForm;
+  if (prodSearch) prodSearch.oninput = renderProducts;
+
+  if (btnSaveProduct) {
+    btnSaveProduct.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+
+      const name = (prodName ? prodName.value : "").trim();
+      if (!name) return setProdMsg("Nome é obrigatório.");
+
+      const price = nnum(prodPrice ? prodPrice.value : "", 0);
+      const cost = nnum(prodCost ? prodCost.value : "", 0);
+      const stock = Math.max(0, Math.floor(nnum(prodStock ? prodStock.value : "", 0)));
+      const stockMin = Math.max(0, Math.floor(nnum(prodStockMin ? prodStockMin.value : "", 0)));
+      const desc = (prodDesc ? prodDesc.value : "").trim();
+
+      const stockBaseId = (prodStockBase ? prodStockBase.value : "").trim();
+      const stockFactor = nnum(prodStockFactor ? prodStockFactor.value : "", 0);
+
+      if (stockBaseId && (!stockFactor || stockFactor <= 0)) {
+        return setProdMsg("Se escolher Stock Base, o Fator deve ser > 0.");
+      }
+      if (stockBaseId && editingProductId === stockBaseId) {
+        return setProdMsg("Um produto não pode consumir stock de si mesmo.");
+      }
+
+      if (!editingProductId) {
+        const p = {
+          id: uid(),
+          active: true,
+          name,
+          price,
+          cost,
+          stock,
+          stockMin,
+          desc,
+          stockBaseId: stockBaseId || "",
+          stockFactor: stockBaseId ? stockFactor : 0,
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+        db.products.push(p);
+        logAction("product.create", "product", p.id, { name: p.name });
+        autoSnapshot("product.create");
+      } else {
+        const p = db.products.find(x => x.id === editingProductId);
+        if (!p) return setProdMsg("Produto não encontrado.");
+        p.name = name;
+        p.price = price;
+        p.cost = cost;
+        p.stock = stock;
+        p.stockMin = stockMin;
+        p.desc = desc;
+        p.stockBaseId = stockBaseId || "";
+        p.stockFactor = stockBaseId ? stockFactor : 0;
+        p.updatedAt = nowISO();
+        logAction("product.update", "product", p.id, { name: p.name });
+        autoSnapshot("product.update");
+      }
+
+      saveDBTouch();
+      setProdMsg("Guardado ✅");
+      resetProductForm();
+      renderProducts();
+      renderPOS();
+      fillInvProducts();
+    };
+  }
+
+  /* =======================
+     Clients (CRUD + histórico)
+  ======================= */
+  let editingClientId = null;
+  let selectedClientId = null;
+
+  const cliSearch = el("cliSearch");
+  const btnNewClient = el("btnNewClient");
+  const cliTable = el("cliTable");
+  const cliCount = el("cliCount");
+
+  const cliFormTitle = el("cliFormTitle");
+  const cliName = el("cliName");
+  const cliPhone = el("cliPhone");
+  const cliNotes = el("cliNotes");
+
+  const btnSaveClient = el("btnSaveClient");
+  const btnCancelClientEdit = el("btnCancelClientEdit");
+  const cliMsg = el("cliMsg");
+
+  const cliHistory = el("cliHistory");
+  const cliHistoryHint = el("cliHistoryHint");
+
+  function setCliMsg(m) {if (cliMsg) cliMsg.textContent = m || "";}
+
+  function resetClientForm() {
+    editingClientId = null;
+    if (cliFormTitle) cliFormTitle.textContent = "Novo Cliente";
+    if (cliName) cliName.value = "";
+    if (cliPhone) cliPhone.value = "";
+    if (cliNotes) cliNotes.value = "";
+    if (btnCancelClientEdit) btnCancelClientEdit.style.display = "none";
+    setCliMsg("");
+  }
+
+  function loadClientToForm(c) {
+    editingClientId = c.id;
+    if (cliFormTitle) cliFormTitle.textContent = "Editar Cliente";
+    if (cliName) cliName.value = c.name || "";
+    if (cliPhone) cliPhone.value = c.phone || "";
+    if (cliNotes) cliNotes.value = c.notes || "";
+    if (btnCancelClientEdit) btnCancelClientEdit.style.display = "block";
+    setCliMsg("");
+  }
+
+  function renderClientHistory(clientId) {
+    if (!cliHistory) return;
+    cliHistory.innerHTML = "";
+    if (!clientId) {
+      if (cliHistoryHint) cliHistoryHint.style.display = "block";
+      return;
+    }
+    if (cliHistoryHint) cliHistoryHint.style.display = "none";
+
+    const sales = (db.sales || []).
+    filter(s => s.clientId === clientId).
+    sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+    if (!sales.length) {
+      const d = document.createElement("div");
+      d.className = "muted";
+      d.textContent = "Sem vendas para este cliente.";
+      cliHistory.appendChild(d);
       return;
     }
 
-    const forcePinForm = e.target.closest("#forcePinForm");
-    if (forcePinForm) {
-      e.preventDefault();
-      const oldPin = document.getElementById("forceOldPin")?.value || "";
-      const newPin = document.getElementById("forceNewPin")?.value || "";
-      changeMyPin(oldPin, newPin);
-      closeModal();
-      renderAll();
-      return;
+    sales.forEach(s => {
+      const row = document.createElement("div");
+      row.className = "rowitem small";
+      const date = s.date || (s.createdAt || "").slice(0, 10) || "—";
+      row.innerHTML = `
+        <div>
+          <b>${date}</b>
+          <div class="muted">${(s.items || []).length} item(s) • ${s.status === "cancelled" ? "CANCELADA" : "OK"}</div>
+        </div>
+        <div>${MT(s.total || 0)}</div>
+        <div class="actions">
+          <button class="btn iconbtn" data-act="view">Ver</button>
+          ${s.status !== "cancelled" ? `<button class="btn danger iconbtn" data-act="cancel">Cancelar</button>` : ""}
+        </div>
+      `;
+
+      row.querySelector('[data-act="view"]').onclick = () => showSaleAlert(s);
+
+      const btnCancel = row.querySelector('[data-act="cancel"]');
+      if (btnCancel) {
+        btnCancel.onclick = () => {
+          if (!canManage()) return alert("Sem permissão.");
+          const reason = prompt("Motivo do cancelamento?") || "";
+          if (!confirm("Confirmar cancelamento desta venda?")) return;
+          cancelSale(s.id, reason);
+          renderClientHistory(clientId);
+        };
+      }
+
+      cliHistory.appendChild(row);
+    });
+  }
+
+  function renderClients() {
+    if (!cliTable) return;
+
+    const q = (cliSearch ? cliSearch.value : "").toLowerCase().trim();
+    const list = (db.clients || []).
+    filter(c => c.active !== false).
+    filter(
+    (c) =>
+    !q ||
+    (c.name || "").toLowerCase().includes(q) ||
+    (c.phone || "").toLowerCase().includes(q)).
+
+    sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    cliTable.innerHTML = "";
+
+    list.forEach(c => {
+      const row = document.createElement("div");
+      row.className = "rowitem";
+      row.innerHTML = `
+        <div>
+          <div><b>${c.name || "-"}</b></div>
+          <div class="muted">${c.phone || "—"}</div>
+        </div>
+        <div class="muted">${c.notes ? c.notes.slice(0, 22) + (c.notes.length > 22 ? "…" : "") : "—"}</div>
+        <div class="muted">Vendas</div>
+        <div><span class="badge">Selecionar</span></div>
+        <div class="actions">
+          <button class="btn iconbtn" data-act="edit">Editar</button>
+          <button class="btn danger iconbtn" data-act="del">Apagar</button>
+        </div>
+      `;
+
+      row.querySelector(".badge").onclick = () => {
+        selectedClientId = c.id;
+        renderClientHistory(selectedClientId);
+      };
+
+      row.querySelector('[data-act="edit"]').onclick = () => {
+        if (!canManage()) return alert("Sem permissão.");
+        loadClientToForm(c);
+      };
+
+      row.querySelector('[data-act="del"]').onclick = () => {
+        if (!canManage()) return alert("Sem permissão.");
+        if (!confirm("Apagar cliente? (será desativado)")) return;
+        c.active = false;
+        c.updatedAt = nowISO();
+        saveDBTouch();
+        if (editingClientId === c.id) resetClientForm();
+        if (selectedClientId === c.id) {
+          selectedClientId = null;
+          renderClientHistory(null);
+        }
+        renderClients();
+        logAction("client.deactivate", "client", c.id, { name: c.name });
+        autoSnapshot("client.deactivate");
+      };
+
+      cliTable.appendChild(row);
+    });
+
+    if (cliCount) cliCount.textContent = `${list.length} cliente(s)`;
+  }
+
+  if (btnNewClient) btnNewClient.onclick = () => {
+    if (!canManage()) return alert("Sem permissão.");
+    resetClientForm();
+  };
+  if (btnCancelClientEdit) btnCancelClientEdit.onclick = resetClientForm;
+  if (cliSearch) cliSearch.oninput = renderClients;
+
+  if (btnSaveClient) {
+    btnSaveClient.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+
+      const name = (cliName ? cliName.value : "").trim();
+      if (!name) return setCliMsg("Nome é obrigatório.");
+
+      const phone = (cliPhone ? cliPhone.value : "").trim();
+      const notes = (cliNotes ? cliNotes.value : "").trim();
+
+      if (!editingClientId) {
+        const c = {
+          id: uid(),
+          active: true,
+          name,
+          phone,
+          notes,
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+        db.clients.push(c);
+        logAction("client.create", "client", c.id, { name: c.name });
+        autoSnapshot("client.create");
+      } else {
+        const c = db.clients.find(x => x.id === editingClientId);
+        if (!c) return setCliMsg("Cliente não encontrado.");
+        c.name = name;
+        c.phone = phone;
+        c.notes = notes;
+        c.updatedAt = nowISO();
+        logAction("client.update", "client", c.id, { name: c.name });
+        autoSnapshot("client.update");
+      }
+
+      saveDBTouch();
+      setCliMsg("Guardado ✅");
+      resetClientForm();
+      renderClients();
+      fillPosClients();
+      fillSalesClientFilter();
+    };
+  }
+
+  /* =======================
+     Purchases (Stock IN + Ledger OUT)
+  ======================= */
+  const purSupplier = el("purSupplier");
+  const purDate = el("purDate");
+  const purAccount = el("purAccount");
+  const purItems = el("purItems");
+  const purTotal = el("purTotal");
+  const purMsg = el("purMsg");
+
+  const btnAddPurItem = el("btnAddPurItem");
+  const btnSavePurchase = el("btnSavePurchase");
+
+  const purFrom = el("purFrom");
+  const purTo = el("purTo");
+  const btnFilterPurchases = el("btnFilterPurchases");
+  const purTable = el("purTable");
+  const purCount = el("purCount");
+
+  let purchaseDraftItems = [];
+
+  function setPurMsg(m) {if (purMsg) purMsg.textContent = m || "";}
+
+  function fillPurchaseAccounts() {
+    if (!purAccount) return;
+    purAccount.innerHTML = "";
+    (db.accounts || []).
+    filter(a => a.active !== false).
+    forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = `${a.name} (${MT(a.balance || 0)})`;
+      purAccount.appendChild(o);
+    });
+  }
+
+  function fillProductOptions(selectEl) {
+    selectEl.innerHTML = "";
+    (db.products || []).
+    filter(p => p.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = p.name;
+      selectEl.appendChild(o);
+    });
+  }
+
+  function calcPurchaseTotal() {
+    const total = purchaseDraftItems.reduce(
+    (s, it) => s + Number(it.qty || 0) * Number(it.unitCost || 0),
+    0);
+
+    if (purTotal) purTotal.textContent = MT(total);
+    return total;
+  }
+
+  function renderPurchaseItems() {
+    if (!purItems) return;
+    purItems.innerHTML = "";
+
+    purchaseDraftItems.forEach((it, idx) => {var _it$qty, _it$unitCost;
+      const row = document.createElement("div");
+      row.className = "rowitem";
+      row.innerHTML = `
+        <div>
+          <div><b>Produto</b></div>
+          <select class="input" data-k="prod"></select>
+        </div>
+        <div>
+          <div class="muted">Qtd</div>
+          <input class="input" data-k="qty" inputmode="numeric" />
+        </div>
+        <div>
+          <div class="muted">Custo unit (MT)</div>
+          <input class="input" data-k="cost" inputmode="decimal" />
+        </div>
+        <div class="muted">Subtotal: <span class="mono" data-k="sub"></span></div>
+        <div class="actions">
+          <button class="btn danger iconbtn" data-k="rm">X</button>
+        </div>
+      `;
+
+      const sel = row.querySelector('select[data-k="prod"]');
+      const inpQty = row.querySelector('input[data-k="qty"]');
+      const inpCost = row.querySelector('input[data-k="cost"]');
+      const sub = row.querySelector('span[data-k="sub"]');
+
+      fillProductOptions(sel);
+      sel.value = it.productId;
+
+      inpQty.value = String((_it$qty = it.qty) !== null && _it$qty !== void 0 ? _it$qty : 1);
+      inpCost.value = String((_it$unitCost = it.unitCost) !== null && _it$unitCost !== void 0 ? _it$unitCost : 0);
+
+      const update = () => {
+        it.productId = sel.value;
+        it.qty = Math.max(1, Math.floor(Number(inpQty.value || 1)));
+        it.unitCost = nnum(inpCost.value, 0);
+        const st = Number(it.qty || 0) * Number(it.unitCost || 0);
+        sub.textContent = MT(st);
+        calcPurchaseTotal();
+      };
+
+      sel.onchange = update;
+      inpQty.oninput = update;
+      inpCost.oninput = update;
+
+      row.querySelector('button[data-k="rm"]').onclick = () => {
+        purchaseDraftItems.splice(idx, 1);
+        renderPurchaseItems();
+      };
+
+      update();
+      purItems.appendChild(row);
+    });
+
+    calcPurchaseTotal();
+  }
+
+  function resetPurchaseForm() {
+    if (purSupplier) purSupplier.value = "";
+    if (purDate) purDate.value = todayISO();
+    purchaseDraftItems = [];
+    setPurMsg("");
+    fillPurchaseAccounts();
+    renderPurchaseItems();
+  }
+
+  if (btnAddPurItem) {
+    btnAddPurItem.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+      if (!(db.products || []).some(p => p.active !== false)) return setPurMsg("Crie produtos primeiro.");
+      const first = (db.products || []).find(p => p.active !== false);
+      purchaseDraftItems.push({ productId: first ? first.id : "", qty: 1, unitCost: 0 });
+      renderPurchaseItems();
+    };
+  }
+
+  if (btnSavePurchase) {
+    btnSavePurchase.onclick = () => {
+      try {
+        if (!canManage()) return alert("Sem permissão.");
+
+        const supplier = (purSupplier ? purSupplier.value : "").trim();
+        if (!supplier) return setPurMsg("Fornecedor é obrigatório.");
+
+        const date = purDate ? purDate.value || todayISO() : todayISO();
+        const accountId = purAccount ? purAccount.value : "";
+        if (!accountId) return setPurMsg("Selecione uma conta.");
+
+        if (!purchaseDraftItems.length) return setPurMsg("Adicione pelo menos 1 item.");
+
+        for (let i = 0; i < purchaseDraftItems.length; i++) {
+          const it = purchaseDraftItems[i];
+          const p = (db.products || []).find(x => x.id === it.productId && x.active !== false);
+          if (!p) throw new Error("Produto inválido na compra.");
+          if (Number(it.qty || 0) <= 0) throw new Error("Quantidade inválida.");
+          if (!Number.isFinite(Number(it.unitCost || 0)) || Number(it.unitCost || 0) < 0)
+          throw new Error("Custo unit inválido.");
+        }
+
+        const total = calcPurchaseTotal();
+
+        purchaseDraftItems.forEach(it => {
+          const p = (db.products || []).find(x => x.id === it.productId);
+          p.stock = Number(p.stock || 0) + Number(it.qty || 0);
+          p.cost = Number(it.unitCost || p.cost || 0);
+          p.updatedAt = nowISO();
+        });
+
+        const purchase = {
+          id: uid(),
+          supplier,
+          date,
+          accountId,
+          total,
+          items: purchaseDraftItems.map(it => ({
+            productId: it.productId,
+            qty: Number(it.qty || 0),
+            unitCost: Number(it.unitCost || 0) })),
+
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+        db.purchases.push(purchase);
+
+        saveDBTouch();
+
+        addLedger({
+          date,
+          type: "out",
+          accountId,
+          amount: total,
+          refType: "purchase",
+          refId: purchase.id,
+          note: `Compra ${supplier}` });
+
+
+        logAction("purchase.create", "purchase", purchase.id, { total, supplier });
+        autoSnapshot("purchase.create");
+
+        setPurMsg("Compra guardada ✅");
+        resetPurchaseForm();
+        renderProducts();
+        renderAccounts();
+        renderLedger();
+        renderPurchases();
+        renderPOS();
+        fillInvProducts();
+      } catch (e) {
+        alert(e.message || e);
+      }
+    };
+  }
+
+  function renderPurchases() {
+    if (!purTable) return;
+
+    const from = purFrom ? purFrom.value : "";
+    const to = purTo ? purTo.value : "";
+
+    const rows = (db.purchases || []).
+    filter(p => !from || p.date >= from).
+    filter(p => !to || p.date <= to).
+    sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+
+    purTable.innerHTML = "";
+
+    rows.forEach(p => {
+      const row = document.createElement("div");
+      row.className = "rowitem small";
+      row.innerHTML = `
+        <div>
+          <div><b>${p.date}</b></div>
+          <div class="muted">${p.supplier} • ${(p.items || []).length} item(s)</div>
+        </div>
+        <div class="mono">${MT(p.total || 0)}</div>
+        <div class="actions"><button class="btn iconbtn">Ver</button></div>
+      `;
+      row.querySelector("button").onclick = () => {
+        const lines = (p.items || []).
+        map(it => {
+          const pr = (db.products || []).find(x => x.id === it.productId) || { name: "—" };
+          return `${it.qty}x ${pr.name} @ ${MT(it.unitCost)}`;
+        }).
+        join("\n");
+        alert(`Compra ${p.id}\nFornecedor: ${p.supplier}\nData: ${p.date}\nTotal: ${MT(p.total)}\n\n${lines}`);
+      };
+      purTable.appendChild(row);
+    });
+
+    if (purCount) purCount.textContent = `${rows.length} compra(s)`;
+  }
+
+  if (btnFilterPurchases) btnFilterPurchases.onclick = renderPurchases;
+
+  /* =======================
+     POS (Sales + stock base)
+  ======================= */
+  const posSearch = el("posSearch");
+  const posCatalog = el("posCatalog");
+  const posCart = el("posCart");
+  const posTotal = el("posTotal");
+  const btnCheckout = el("btnCheckout");
+  // Mobile cart UI
+  const mcartbar = el("mcartbar");
+  const mcartTotal = el("mcartTotal");
+  const btnOpenCart = el("btnOpenCart");
+  const btnCheckoutMobile = el("btnCheckoutMobile");
+  const posCartCard = el("posCartCard");
+
+
+  const posClient = el("posClient");
+  const posAccount = el("posAccount");
+  const posMsg = el("posMsg");
+  function isMobile() {
+    return window.matchMedia && window.matchMedia("(max-width: 900px)").matches;
+  }
+
+  function setCartDrawer(open) {
+    if (!posCartCard) return;
+    if (open) posCartCard.classList.add("open");else
+    posCartCard.classList.remove("open");
+  }
+
+  if (btnOpenCart) {
+    btnOpenCart.onclick = () => {
+      // toggle drawer
+      if (!posCartCard) return;
+      const open = !posCartCard.classList.contains("open");
+      setCartDrawer(open);
+    };
+  }
+
+  // fechar drawer ao clicar fora (opcional e seguro)
+  document.addEventListener("click", e => {
+    if (!isMobile()) return;
+    if (!posCartCard) return;
+    if (!posCartCard.classList.contains("open")) return;
+    const t = e.target;
+    const clickedInside = posCartCard.contains(t) || mcartbar && mcartbar.contains(t);
+    if (!clickedInside) setCartDrawer(false);
+  });
+
+  // botão finalizar do mobile usa o mesmo checkout
+  if (btnCheckoutMobile && btnCheckout) {
+    btnCheckoutMobile.onclick = () => btnCheckout.click();
+  }
+
+
+  function setPosMsg(m) {if (posMsg) posMsg.textContent = m || "";}
+
+  let cart = [];
+
+  function fillPosClients() {
+    if (!posClient) return;
+    posClient.innerHTML = "";
+    const o0 = document.createElement("option");
+    o0.value = "";
+    o0.textContent = "— Sem cliente —";
+    posClient.appendChild(o0);
+
+    (db.clients || []).
+    filter(c => c.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(c => {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = `${c.name}${c.phone ? " • " + c.phone : ""}`;
+      posClient.appendChild(o);
+    });
+
+    fillSalesClientFilter();
+  }
+
+  function fillPosAccounts() {
+    if (!posAccount) return;
+    posAccount.innerHTML = "";
+    (db.accounts || []).
+    filter(a => a.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = `${a.name} (${MT(a.balance || 0)})`;
+      posAccount.appendChild(o);
+    });
+
+    fillSalesAccountFilter();
+  }
+
+  function renderPOS() {
+    setPosMsg("");
+    fillPosClients();
+    renderAccounts(); // garante saldos
+    fillPosAccounts();
+
+    if (!posCatalog) return;
+
+    const q = (posSearch ? posSearch.value : "").toLowerCase().trim();
+    const list = (db.products || []).
+    filter(p => p.active !== false).
+    filter(p => !q || (p.name || "").toLowerCase().includes(q)).
+    sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+
+    posCatalog.innerHTML = "";
+
+    list.forEach(p => {
+      const b = document.createElement("button");
+      b.className = "btn";
+      b.textContent = `${p.name} — ${MT(p.price || 0)}`;
+      b.onclick = () => {
+        const found = cart.find(x => x.productId === p.id);
+        if (found) found.qty += 1;else
+        cart.push({ productId: p.id, name: p.name, price: Number(p.price || 0), qty: 1 });
+        renderCart();
+      };
+      posCatalog.appendChild(b);
+    });
+
+    renderCart();
+  }
+
+  function renderCart() {
+    if (!posCart) return;
+    posCart.innerHTML = "";
+
+    let total = 0;
+    cart.forEach((c, i) => {
+      total += Number(c.price || 0) * Number(c.qty || 1);
+
+      const row = document.createElement("div");
+      row.className = "row between";
+      row.innerHTML = `
+        <div class="row gap">
+          <span class="badge">${c.qty}x</span>
+          <div>${c.name}</div>
+        </div>
+        <button class="btn danger">X</button>
+      `;
+      row.querySelector("button").onclick = () => {
+        cart.splice(i, 1);
+        renderCart();
+      };
+      posCart.appendChild(row);
+    });
+
+    if (posTotal) posTotal.textContent = MT(total);
+    // atualiza barra mobile
+    if (mcartTotal) mcartTotal.textContent = MT(total);
+    if (mcartbar) mcartbar.style.display = isMobile() ? "block" : "none";
+
+  }
+
+  function validateAndApplyStockForSale(enrichedItems) {
+    // valida
+    enrichedItems.forEach(it => {
+      const p = (db.products || []).find(x => x.id === it.productId && x.active !== false);
+      if (!p) throw new Error(`Produto inválido: ${it.name}`);
+
+      const qty = Math.max(1, Number(it.qty || 1));
+
+      if (it.stockBaseId) {
+        const base = (db.products || []).find(x => x.id === it.stockBaseId && x.active !== false);
+        if (!base) throw new Error(`Stock base não encontrado para ${it.name}`);
+        const need = qty * Number(it.stockFactor || 0);
+        if (need <= 0) throw new Error(`Fator inválido em ${it.name}`);
+        if (Number(base.stock || 0) < need) throw new Error(`Stock insuficiente em ${base.name}`);
+      } else {
+        if (Number(p.stock || 0) < qty) throw new Error(`Stock insuficiente em ${it.name}`);
+      }
+    });
+
+    // aplica
+    enrichedItems.forEach(it => {
+      const qty = Math.max(1, Number(it.qty || 1));
+      if (it.stockBaseId) {
+        applyStockDelta(it.stockBaseId, -(qty * Number(it.stockFactor || 0)));
+      } else {
+        applyStockDelta(it.productId, -qty);
+      }
+    });
+
+    saveDBTouch();
+  }
+
+  if (posSearch) posSearch.oninput = renderPOS;
+
+  if (btnCheckout) {
+    btnCheckout.onclick = () => {
+      try {
+        if (!cart.length) return setPosMsg("Carrinho vazio.");
+
+        const accountId = (posAccount ? posAccount.value : "").trim();
+        if (!accountId) return setPosMsg("Selecione a conta de recebimento.");
+
+        const clientId = (posClient ? posClient.value : "").trim() || "";
+
+        // captura base/factor para estorno perfeito
+        const enrichedItems = cart.map(i => {
+          const p = (db.products || []).find(x => x.id === i.productId) || {};
+          return {
+            productId: i.productId,
+            name: i.name,
+            price: Number(i.price || 0),
+            qty: Number(i.qty || 1),
+            stockBaseId: p.stockBaseId || "",
+            stockFactor: Number(p.stockFactor || 0) };
+
+        });
+
+        validateAndApplyStockForSale(enrichedItems);
+
+        const total = enrichedItems.reduce((s, c) => s + Number(c.price || 0) * Number(c.qty || 1), 0);
+
+        const sale = {
+          id: uid(),
+          date: todayISO(),
+          clientId,
+          accountId,
+          total,
+          items: enrichedItems,
+          status: "ok",
+          cancelledAt: "",
+          cancelReason: "",
+          cancelRef: null,
+          ledgerId: "",
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+
+        db.sales.push(sale);
+        saveDBTouch();
+
+        const note = (() => {
+          if (!clientId) return "Venda";
+          const c = (db.clients || []).find(x => x.id === clientId);
+          return c ? `Venda: ${c.name}` : "Venda (cliente)";
+        })();
+
+        const led = addLedger({
+          date: sale.date,
+          type: "in",
+          accountId,
+          amount: total,
+          refType: "sale",
+          refId: sale.id,
+          note });
+
+
+
+        sale.ledgerId = (led === null || led === void 0 ? void 0 : led.id) || "";
+        sale.updatedAt = nowISO();
+        saveDBTouch();
+
+        logAction("sale.create", "sale", sale.id, { total, clientId, accountId });
+        autoSnapshot("sale.create");
+
+        cart = [];
+        renderPOS();
+        renderProducts();
+        renderAccounts();
+        renderLedger();
+        renderSales();
+        fillInvProducts();
+        setCartDrawer(false);
+
+
+        if (selectedClientId) renderClientHistory(selectedClientId);
+
+        setPosMsg("Venda registada ✅");
+      } catch (e) {
+        alert(e.message || e);
+      }
+    };
+  }
+
+  /* =======================
+     Stock view (tabs)
+  ======================= */
+  const tabStockInv = el("tabStockInv");
+  const tabStockSales = el("tabStockSales");
+  const panelInv = el("panelInv");
+  const panelSales = el("panelSales");
+
+  function showStockTab(which) {
+    if (!panelInv || !panelSales) return;
+    const invOn = which === "inv";
+    panelInv.style.display = invOn ? "block" : "none";
+    panelSales.style.display = invOn ? "none" : "block";
+
+    if (tabStockInv) tabStockInv.className = invOn ? "btn" : "btn ghost";
+    if (tabStockSales) tabStockSales.className = invOn ? "btn ghost" : "btn";
+
+    if (invOn) renderInventory();else
+    renderSales();
+  }
+
+  if (tabStockInv) tabStockInv.onclick = () => showStockTab("inv");
+  if (tabStockSales) tabStockSales.onclick = () => showStockTab("sales");
+
+  function renderStockView() {
+    showStockTab("inv");
+  }
+
+  /* =======================
+     Inventory UI
+  ======================= */
+  const invProduct = el("invProduct");
+  const invType = el("invType");
+  const invQty = el("invQty");
+  const invNewStock = el("invNewStock");
+  const invNote = el("invNote");
+  const btnSaveInv = el("btnSaveInv");
+  const invMsg = el("invMsg");
+
+  const invFrom = el("invFrom");
+  const invTo = el("invTo");
+  const btnInvFilter = el("btnInvFilter");
+  const invTable = el("invTable");
+  const invCount = el("invCount");
+
+  function setInvMsg(m) {if (invMsg) invMsg.textContent = m || "";}
+
+  function fillInvProducts() {
+    if (!invProduct) return;
+    invProduct.innerHTML = "";
+    (db.products || []).
+    filter(p => p.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(p => {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = `${p.name} (stock: ${Number(p.stock || 0)})`;
+      invProduct.appendChild(o);
+    });
+  }
+
+  function renderInventory() {
+    fillInvProducts();
+    renderInventoryHistory();
+  }
+
+  function renderInventoryHistory() {
+    if (!invTable) return;
+
+    const from = invFrom ? invFrom.value : "";
+    const to = invTo ? invTo.value : "";
+
+    const rows = (db.inventory || []).
+    filter(r => !from || (r.date || "") >= from).
+    filter(r => !to || (r.date || "") <= to).
+    sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+    invTable.innerHTML = "";
+
+    rows.forEach(r => {
+      const p = (db.products || []).find(x => x.id === r.productId) || { name: "—" };
+      const row = document.createElement("div");
+      row.className = "rowitem small";
+      row.innerHTML = `
+        <div>
+          <div><b>${r.date || (r.createdAt || "").slice(0, 10) || "—"}</b>
+            <span class="badge">${r.type === "in" ? "Entrada" : "Saída"}</span>
+          </div>
+          <div class="muted">${p.name} • ${r.note || ""}</div>
+        </div>
+        <div class="mono">${Number(r.qty || 0)}</div>
+      `;
+      invTable.appendChild(row);
+    });
+
+    if (invCount) invCount.textContent = `${rows.length} ajuste(s)`;
+  }
+
+  if (btnInvFilter) btnInvFilter.onclick = renderInventoryHistory;
+
+  if (btnSaveInv) {
+    btnSaveInv.onclick = () => {
+      try {
+        if (!canManage()) return alert("Sem permissão.");
+
+        const productId = invProduct ? invProduct.value : "";
+        if (!productId) return setInvMsg("Selecione um produto.");
+
+        const mode = invType ? invType.value : "in";
+        const qty = Math.floor(nnum(invQty ? invQty.value : "", 0));
+        const newStock = Math.floor(nnum(invNewStock ? invNewStock.value : "", 0));
+        const note = (invNote ? invNote.value : "").trim();
+
+        if ((mode === "in" || mode === "out") && qty <= 0) return setInvMsg("Quantidade deve ser > 0.");
+        if (mode === "adjust" && newStock < 0) return setInvMsg("Novo stock inválido.");
+
+        inventoryAdjust({ productId, mode, qty, newStock, note });
+
+        setInvMsg("Ajuste guardado ✅");
+        if (invQty) invQty.value = "";
+        if (invNewStock) invNewStock.value = "";
+        if (invNote) invNote.value = "";
+
+        renderProducts();
+        renderPOS();
+        renderInventory();
+      } catch (e) {
+        setInvMsg("Erro: " + (e.message || e));
+      }
+    };
+  }
+
+  /* =======================
+     Sales (Histórico + Cancel)
+  ======================= */
+  const salesFrom = el("salesFrom");
+  const salesTo = el("salesTo");
+  const salesClientFilter = el("salesClientFilter");
+  const salesAccountFilter = el("salesAccountFilter");
+  const salesStatusFilter = el("salesStatusFilter");
+  const btnApplySalesFilters = el("btnApplySalesFilters");
+  const salesTable = el("salesTable");
+  const salesCount = el("salesCount");
+
+  function fillSalesClientFilter() {
+    if (!salesClientFilter) return;
+    salesClientFilter.innerHTML = "";
+    const o0 = document.createElement("option");
+    o0.value = "";
+    o0.textContent = "Todos os clientes";
+    salesClientFilter.appendChild(o0);
+
+    (db.clients || []).
+    filter(c => c.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(c => {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = c.name;
+      salesClientFilter.appendChild(o);
+    });
+  }
+
+  function fillSalesAccountFilter() {
+    if (!salesAccountFilter) return;
+    salesAccountFilter.innerHTML = "";
+    const o0 = document.createElement("option");
+    o0.value = "";
+    o0.textContent = "Todas as contas";
+    salesAccountFilter.appendChild(o0);
+
+    (db.accounts || []).
+    filter(a => a.active !== false).
+    sort((a, b) => (a.name || "").localeCompare(b.name || "")).
+    forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id;
+      o.textContent = a.name;
+      salesAccountFilter.appendChild(o);
+    });
+  }
+
+  function showSaleAlert(sale) {
+    const client = sale.clientId ? (db.clients || []).find(c => c.id === sale.clientId) : null;
+    const acc = (db.accounts || []).find(a => a.id === sale.accountId) || null;
+    const lines = (sale.items || []).map(it => `${it.qty}x ${it.name} @ ${MT(it.price)}`).join("\n");
+    const st = sale.status === "cancelled" ? `CANCELADA (${sale.cancelReason || "—"})` : "OK";
+    alert(
+    `Venda ${sale.id}\nData: ${sale.date}\nCliente: ${client ? client.name : "—"}\nConta: ${acc ? acc.name : "—"}\nStatus: ${st}\nTotal: ${MT(sale.total || 0)}\n\n${lines}`);
+
+  }
+
+  function revertSaleStock(sale) {
+    (sale.items || []).forEach(it => {
+      const qty = Math.max(1, Number(it.qty || 1));
+      if (it.stockBaseId && Number(it.stockFactor || 0) > 0) {
+        const delta = qty * Number(it.stockFactor || 0);
+        applyStockDelta(it.stockBaseId, +delta);
+        db.inventory.push({
+          id: uid(),
+          date: todayISO(),
+          createdAt: nowISO(),
+          type: "in",
+          productId: it.stockBaseId,
+          qty: delta,
+          note: `Estorno venda ${sale.id}`,
+          refType: "sale_cancel",
+          refId: sale.id });
+
+      } else {
+        applyStockDelta(it.productId, +qty);
+        db.inventory.push({
+          id: uid(),
+          date: todayISO(),
+          createdAt: nowISO(),
+          type: "in",
+          productId: it.productId,
+          qty: qty,
+          note: `Estorno venda ${sale.id}`,
+          refType: "sale_cancel",
+          refId: sale.id });
+
+      }
+    });
+    saveDBTouch();
+  }
+
+  function cancelSale(saleId, reason) {
+    const sale = (db.sales || []).find(s => s.id === saleId);
+    if (!sale) return alert("Venda não encontrada.");
+    if (sale.status === "cancelled") return alert("Esta venda já foi cancelada.");
+
+    // 1) repor stock + log inventário
+    revertSaleStock(sale);
+
+    // 2) ledger inverso (OUT)
+    const out = addLedger({
+      date: sale.date || todayISO(),
+      type: "out",
+      accountId: sale.accountId,
+      amount: Number(sale.total || 0),
+      refType: "sale_cancel",
+      refId: sale.id,
+      note: `Estorno venda ${sale.id}` });
+
+
+    // 3) marcar venda
+    sale.status = "cancelled";
+    sale.cancelReason = (reason || "").trim() || "Sem motivo";
+    sale.cancelledAt = nowISO();
+    sale.updatedAt = nowISO();
+    sale.cancelRef = { ledgerId: (out === null || out === void 0 ? void 0 : out.id) || "" };
+    saveDBTouch();
+
+    logAction("sale.cancel", "sale", sale.id, { total: sale.total, reason: sale.cancelReason });
+    autoSnapshot("sale.cancel");
+
+    renderProducts();
+    renderAccounts();
+    renderLedger();
+    renderSales();
+    if (selectedClientId) renderClientHistory(selectedClientId);
+  }
+
+  function renderSales() {
+    if (!salesTable) return;
+
+    fillSalesClientFilter();
+    fillSalesAccountFilter();
+
+    const from = salesFrom ? salesFrom.value : "";
+    const to = salesTo ? salesTo.value : "";
+    const clientId = salesClientFilter ? salesClientFilter.value : "";
+    const accId = salesAccountFilter ? salesAccountFilter.value : "";
+    const st = salesStatusFilter ? salesStatusFilter.value : "";
+
+    const rows = (db.sales || []).
+    filter(s => !from || (s.date || "") >= from).
+    filter(s => !to || (s.date || "") <= to).
+    filter(s => !clientId || s.clientId === clientId).
+    filter(s => !accId || s.accountId === accId).
+    filter(s => !st || s.status === st).
+    sort(
+    (a, b) =>
+    String(b.date || "").localeCompare(String(a.date || "")) ||
+    String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+
+
+    salesTable.innerHTML = "";
+
+    rows.forEach(s => {
+      const client = s.clientId ? (db.clients || []).find(c => c.id === s.clientId) : null;
+      const acc = (db.accounts || []).find(a => a.id === s.accountId) || null;
+
+      const row = document.createElement("div");
+      row.className = "rowitem small";
+      row.innerHTML = `
+        <div>
+          <div><b>${s.date || "—"}</b> ${
+      s.status === "cancelled" ? `<span class="badge">CANCELADA</span>` : `<span class="badge">OK</span>`
+      }</div>
+          <div class="muted">${client ? client.name : "—"} • ${acc ? acc.name : "—"} • ${(s.items || []).length} item(s)</div>
+        </div>
+        <div class="mono">${MT(s.total || 0)}</div>
+        <div class="actions">
+          <button class="btn iconbtn" data-act="view">Ver</button>
+          ${s.status !== "cancelled" ? `<button class="btn danger iconbtn" data-act="cancel">Cancelar</button>` : ""}
+        </div>
+      `;
+
+      row.querySelector('[data-act="view"]').onclick = () => showSaleAlert(s);
+
+      const bcancel = row.querySelector('[data-act="cancel"]');
+      if (bcancel) {
+        bcancel.onclick = () => {
+          if (!canManage()) return alert("Sem permissão.");
+          const reason = prompt("Motivo do cancelamento?") || "";
+          if (!confirm("Confirmar cancelamento desta venda?")) return;
+          cancelSale(s.id, reason);
+        };
+      }
+
+      salesTable.appendChild(row);
+    });
+
+    if (salesCount) salesCount.textContent = `${rows.length} venda(s)`;
+  }
+
+  if (btnApplySalesFilters) btnApplySalesFilters.onclick = renderSales;
+  function iso(v) {return String(v || "");}
+  function newer(a, b) {
+    // retorna true se a.updatedAt é mais recente que b.updatedAt
+    return iso(a === null || a === void 0 ? void 0 : a.updatedAt) > iso(b === null || b === void 0 ? void 0 : b.updatedAt);
+  }
+
+  function mergeById_LWW(localArr, remoteArr) {
+    const map = new Map();
+    (Array.isArray(localArr) ? localArr : []).forEach(x => {
+      if (!(x !== null && x !== void 0 && x.id)) return;
+      map.set(x.id, x);
+    });
+
+    (Array.isArray(remoteArr) ? remoteArr : []).forEach(r => {
+      if (!(r !== null && r !== void 0 && r.id)) return;
+      const cur = map.get(r.id);
+      if (!cur) {
+        map.set(r.id, r);
+      } else {
+        // Last-write-wins
+        map.set(r.id, newer(r, cur) ? r : cur);
+      }
+    });
+
+    return Array.from(map.values());
+  }
+
+  // Para coleções "append-only" (não substituir: apenas unir)
+  function mergeUnionById(localArr, remoteArr) {
+    const map = new Map();
+    (Array.isArray(localArr) ? localArr : []).forEach(x => (x === null || x === void 0 ? void 0 : x.id) && map.set(x.id, x));
+    (Array.isArray(remoteArr) ? remoteArr : []).forEach(x => (x === null || x === void 0 ? void 0 : x.id) && !map.has(x.id) && map.set(x.id, x));
+    return Array.from(map.values());
+  }
+
+  function mergeDB(localDB, remoteDB) {
+    const L = ensureAllUpdatedAt(normalizeDB(localDB));
+    const R = ensureAllUpdatedAt(normalizeDB(remoteDB));
+
+    // entidades "stateful" → LWW por updatedAt
+    L.users = mergeById_LWW(L.users, R.users);
+    L.products = mergeById_LWW(L.products, R.products);
+    L.clients = mergeById_LWW(L.clients, R.clients);
+    L.accounts = mergeById_LWW(L.accounts, R.accounts);
+    L.sales = mergeById_LWW(L.sales, R.sales);
+    L.purchases = mergeById_LWW(L.purchases, R.purchases);
+
+    // append-only → união por ID
+    L.ledger = mergeUnionById(L.ledger, R.ledger);
+    L.inventory = mergeUnionById(L.inventory, R.inventory);
+    L.audit = mergeUnionById(L.audit, R.audit);
+
+    // settings/online: preferir local (não sobrescrever config do device)
+    L.settings = L.settings || { autoSnapshots: true, snapshotRetention: 30 };
+    L.online = L.online || { enabled: false, url: "", key: "" };
+
+    // meta
+    L.meta = L.meta || {};
+    L.meta.updatedAt = nowISO();
+    return L;
+  }
+
+  /* =======================
+     Supabase snapshots
+  ======================= */
+  async function sbFetch(url, key, path, options = {}) {
+    const res = await fetch(`${url}/rest/v1/${path}`, {
+      ...options,
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Prefer: options.headers && options.headers.Prefer ? options.headers.Prefer : "return=representation",
+        ...(options.headers || {}) } });
+
+
+    const t = await res.text();
+    const d = t ? JSON.parse(t) : null;
+    if (!res.ok) throw new Error(d && d.message ? d.message : String(res.status));
+    return d;
+  }
+
+  function setOnlineConfig(url, key) {
+    db.online = { enabled: true, url, key };
+    saveDBTouch();
+  }
+
+  async function pushSnapshot(trigger) {var _db$online3, _db$settings;
+    if (!((_db$online3 = db.online) !== null && _db$online3 !== void 0 && _db$online3.enabled)) throw new Error("Supabase não está ativo.");
+    const url = db.online.url;
+    const key = db.online.key;
+    if (!url || !key) throw new Error("Config Supabase incompleta.");
+
+    const ws = (workspaceId || "").trim();
+    if (!ws) throw new Error("Workspace vazio.");
+
+    const payload = JSON.parse(JSON.stringify(db));
+
+    await sbFetch(url, key, `gf_snapshots`, {
+      method: "POST",
+      body: JSON.stringify({
+        workspace_id: ws,
+        created_at: nowISO(),
+        trigger: trigger || "manual",
+        payload }) });
+
+
+
+    const keepN = Number(((_db$settings = db.settings) === null || _db$settings === void 0 ? void 0 : _db$settings.snapshotRetention) || 30);
+    if (keepN > 0) {
+      const all = await sbFetch(
+      url,
+      key,
+      `gf_snapshots?select=id,created_at&workspace_id=eq.${ws}&order=created_at.desc`);
+
+      if (Array.isArray(all) && all.length > keepN) {
+        const toDelete = all.slice(keepN).map(r => r.id).filter(Boolean);
+        for (let i = 0; i < toDelete.length; i++) {
+          await sbFetch(url, key, `gf_snapshots?id=eq.${toDelete[i]}`, { method: "DELETE" });
+        }
+      }
+    }
+
+    logAction("backup.snapshot", "snapshot", "", { trigger });
+  }
+
+  async function pullLatestSnapshot() {var _db$online4;
+    if (!((_db$online4 = db.online) !== null && _db$online4 !== void 0 && _db$online4.enabled)) throw new Error("Supabase não está ativo.");
+    const url = db.online.url;
+    const key = db.online.key;
+    if (!url || !key) throw new Error("Config Supabase incompleta.");
+
+    const ws = (workspaceId || "").trim();
+    if (!ws) throw new Error("Workspace vazio.");
+
+    const rows = await sbFetch(
+    url,
+    key,
+    `gf_snapshots?select=payload,created_at&workspace_id=eq.${ws}&order=created_at.desc&limit=1`);
+
+    if (!rows || !rows.length) throw new Error("Nenhum backup encontrado.");
+
+    return rows[0];
+  }
+
+  function autoSnapshot(trigger) {var _db$settings2, _db$online5;
+    if (!((_db$settings2 = db.settings) !== null && _db$settings2 !== void 0 && _db$settings2.autoSnapshots)) return;
+    if (!((_db$online5 = db.online) !== null && _db$online5 !== void 0 && _db$online5.enabled)) return;
+
+    debounce("autoSnap", 45000, async () => {
+      try {
+        await pushSnapshot(trigger || "auto");
+      } catch (e) {
+        logAction("backup.fail", "", "", { error: String((e === null || e === void 0 ? void 0 : e.message) || e) });
+      }
+    });
+  }
+
+  // Restore (login screen)
+  if (btnLoadFromCloud) {
+    btnLoadFromCloud.onclick = async () => {
+      try {
+        const ws = (wsInput ? wsInput.value : "").trim();
+        if (!ws) return setCloudMsg("Digite o Workspace.");
+
+        const url = (sbUrlLogin ? sbUrlLogin.value : "").trim();
+        const key = (sbKeyLogin ? sbKeyLogin.value : "").trim();
+        if (!url || !key) return setCloudMsg("Supabase URL e Key obrigatórios.");
+
+        setOnlineConfig(url, key);
+        setCloudMsg("A carregar dados da nuvem...");
+
+        // temporariamente set workspace para puxar
+        workspaceId = ws;
+        localStorage.setItem(WS_KEY, ws);
+        if (wsBadge) wsBadge.textContent = `Workspace: ${workspaceId || "—"}`;
+
+        const latest = await pullLatestSnapshot();
+
+        if (!confirm("Isto vai substituir os dados locais deste dispositivo. Continuar?")) {
+          setCloudMsg("Cancelado.");
+          return;
+        }
+
+        save(DB_KEY, latest.payload);
+
+        db = load(DB_KEY, emptyDB());
+        db.inventory = db.inventory || [];
+        db.audit = db.audit || [];
+        db.settings = db.settings || { autoSnapshots: true, snapshotRetention: 30 };
+        db.online = db.online || { enabled: true, url, key };
+
+        refreshUsersDropdown();
+        setCloudMsg("Backup restaurado com sucesso.");
+        logAction("backup.restore", "snapshot", "", { created_at: latest.created_at });
+      } catch (e) {
+        setCloudMsg("Erro: " + (e.message || e));
+      }
+    };
+  }
+
+
+
+  /* =======================
+     Settings (Config view)
+  ======================= */
+  const sbUrl = el("sbUrl");
+  const sbKey = el("sbKey");
+  const btnSaveOnline = el("btnSaveOnline");
+  const btnDisableOnline = el("btnDisableOnline");
+  const btnBackupNow = el("btnBackupNow");
+  const sbMsg = el("sbMsg");
+
+  const autoSnapshotsToggle = el("autoSnapshotsToggle");
+  const snapshotRetention = el("snapshotRetention");
+  const btnSaveSettings = el("btnSaveSettings");
+  const settingsMsg = el("settingsMsg");
+
+  const btnExportJSON = el("btnExportJSON");
+  const fileImportJSON = el("fileImportJSON");
+  const btnImportJSON = el("btnImportJSON");
+  const jsonMsg = el("jsonMsg");
+
+  function setSbMsg(m) {if (sbMsg) sbMsg.textContent = m || "";}
+  function setSettingsMsg(m) {if (settingsMsg) settingsMsg.textContent = m || "";}
+  function setJsonMsg(m) {if (jsonMsg) jsonMsg.textContent = m || "";}
+
+
+  function canManageUsers() {var _session4;
+    return ((_session4 = session) === null || _session4 === void 0 ? void 0 : _session4.role) === "admin";
+  }
+
+  let editingUserId = null;
+
+  function renderUsersManagement() {
+    const usersTable = el("usersTable");
+    const usersCount = el("usersCount");
+    const usrMsg = el("usrMsg");
+
+    const usrFormTitle = el("usrFormTitle");
+    const usrName = el("usrName");
+    const usrRole = el("usrRole");
+    const usrPin = el("usrPin");
+    const usrQ = el("usrQ");
+    const usrA = el("usrA");
+
+    const btnSaveUser = el("btnSaveUser");
+    const btnCancelUserEdit = el("btnCancelUserEdit");
+    const btnRefreshUsers = el("btnRefreshUsers");
+
+    if (!usersTable || !btnSaveUser) return;
+
+    // Bloqueio por permissão
+    const disabled = !canManageUsers();
+    [usrName, usrRole, usrPin, usrQ, usrA, btnSaveUser].forEach(x => {if (x) x.disabled = disabled;});
+    if (usrMsg) usrMsg.textContent = disabled ? "Apenas admin pode gerir utilizadores." : "";
+
+    const clearForm = () => {
+      editingUserId = null;
+      if (usrFormTitle) usrFormTitle.textContent = "Criar Utilizador";
+      if (usrName) usrName.value = "";
+      if (usrRole) usrRole.value = "staff";
+      if (usrPin) usrPin.value = "";
+      if (usrQ) usrQ.value = "";
+      if (usrA) usrA.value = "";
+      if (btnCancelUserEdit) btnCancelUserEdit.style.display = "none";
+      if (usrMsg) usrMsg.textContent = "";
+    };
+
+    const startEdit = u => {
+      editingUserId = u.id;
+      if (usrFormTitle) usrFormTitle.textContent = "Editar Utilizador";
+      if (usrName) usrName.value = u.name || "";
+      if (usrRole) usrRole.value = u.role || "staff";
+      if (usrPin) usrPin.value = ""; // não mostramos PIN
+      if (usrQ) usrQ.value = u.recoveryQ || "";
+      if (usrA) usrA.value = ""; // não mostramos resposta
+      if (btnCancelUserEdit) btnCancelUserEdit.style.display = "inline-flex";
+      if (usrMsg) usrMsg.textContent = "";
+    };
+
+    const renderTable = () => {
+      usersTable.innerHTML = "";
+      const users = (db.users || []).slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+      if (usersCount) usersCount.textContent = `${users.length} utilizador(es)`;
+
+      if (!users.length) {
+        usersTable.innerHTML = `<div class="muted">Sem utilizadores.</div>`;
+        return;
+      }
+
+      users.forEach(u => {
+        const row = document.createElement("div");
+        row.className = "row between";
+        const status = u.active === false ? "🔒" : "✅";
+
+
+        row.innerHTML = `
+        <div>
+          <b>${escapeHTML(u.name || "Sem nome")}</b>
+          <div class="muted">${status} role: <span class="mono">${u.role || "staff"}</span></div>
+        </div>
+        <div class="row gap">
+          <button class="btn ghost" data-act="edit">Editar</button>
+          <button class="btn ghost" data-act="role">Role</button>
+          <button class="btn ghost" data-act="pin">Reset PIN</button>
+          <button class="btn ${u.disabled ? "" : "danger"}" data-act="toggle">${u.disabled ? "Ativar" : "Desativar"}</button>
+        </div>
+      `;
+
+        // actions
+        row.querySelector('[data-act="edit"]').onclick = () => startEdit(u);
+
+        row.querySelector('[data-act="role"]').onclick = () => {
+          if (!canManageUsers()) return;
+          const newRole = prompt("Novo role (admin/manager/staff):", u.role || "staff");
+          if (!newRole) return;
+          const v = newRole.trim().toLowerCase();
+          if (!["admin", "manager", "staff"].includes(v)) return alert("Role inválido.");
+          u.role = v;
+          u.updatedAt = nowISO();
+          saveDBTouch();
+          logAction("user.role", "user", u.id, { role: v });
+          renderTable();
+          refreshUsersDropdown();
+        };
+
+        row.querySelector('[data-act="pin"]').onclick = () => {
+          if (!canManageUsers()) return;
+          if (!confirm(`Reset PIN de "${u.name}"?`)) return;
+          u.pin = ""; // forçar definir novo
+          u.mustChangePin = true; // obriga a trocar no próximo login (se tiveres essa lógica)
+          u.updatedAt = nowISO();
+          saveDBTouch();
+          logAction("user.resetPin", "user", u.id, {});
+          alert("PIN resetado. Defina um novo PIN (editar utilizador).");
+          renderTable();
+          refreshUsersDropdown();
+        };
+
+        row.querySelector('[data-act="toggle"]').onclick = () => {
+          if (!canManageUsers()) return;
+          if (u.id === session.userId && u.active !== false)
+          {
+            return alert("Não podes desativar o teu próprio utilizador.");
+          }
+          u.active = u.active === false ? true : false;
+
+          u.updatedAt = nowISO();
+          saveDBTouch();
+          logAction("user.toggle", "user", u.id, { disabled: u.disabled });
+          renderTable();
+          refreshUsersDropdown();
+        };
+
+        // bloquear botões se não for admin
+        if (!canManageUsers()) {
+          row.querySelectorAll("button").forEach(b => b.disabled = true);
+        }
+
+        usersTable.appendChild(row);
+      });
+    };
+
+    // listeners 1x
+    btnRefreshUsers.onclick = () => renderTable();
+
+    btnCancelUserEdit.onclick = () => clearForm();
+
+    btnSaveUser.onclick = () => {
+      if (!canManageUsers()) return;
+
+      const name = ((usrName === null || usrName === void 0 ? void 0 : usrName.value) || "").trim();
+      const role = ((usrRole === null || usrRole === void 0 ? void 0 : usrRole.value) || "staff").trim();
+      const pin = ((usrPin === null || usrPin === void 0 ? void 0 : usrPin.value) || "").trim();
+      const q = ((usrQ === null || usrQ === void 0 ? void 0 : usrQ.value) || "").trim();
+      const a = ((usrA === null || usrA === void 0 ? void 0 : usrA.value) || "").trim();
+
+      if (!name) return usrMsg.textContent = "Nome é obrigatório.";
+      if (!["admin", "manager", "staff"].includes(role)) return usrMsg.textContent = "Role inválido.";
+
+      if (!editingUserId) {
+        if (!pin || pin.length < 4) return usrMsg.textContent = "PIN obrigatório (mín. 4 dígitos).";
+        const u = {
+          id: uid(),
+          name,
+          role,
+          pin,
+          recoveryQ: q || "",
+          recoveryA: a || "",
+          disabled: false,
+          createdAt: nowISO(),
+          updatedAt: nowISO() };
+
+        db.users.push(u);
+        saveDBTouch();
+        logAction("user.create", "user", u.id, { role });
+        usrMsg.textContent = "Utilizador criado ✅";
+      } else {
+        const u = db.users.find(x => x.id === editingUserId);
+        if (!u) return usrMsg.textContent = "Utilizador não encontrado.";
+        u.name = name;
+        u.role = role;
+        if (pin) {u.pin = pin;u.mustChangePin = false;} // só altera se preencher
+        if (q) u.recoveryQ = q;
+        if (a) u.recoveryA = a;
+        u.updatedAt = nowISO();
+        saveDBTouch();
+        logAction("user.update", "user", u.id, { role });
+        usrMsg.textContent = "Utilizador atualizado ✅";
+      }
+
+      clearForm();
+      renderTable();
+      refreshUsersDropdown();
+    };
+
+    renderTable();
+    clearForm();
+  }
+
+  function renderSettings() {var _db$online6, _db$online7, _db$settings3, _db$settings$snapshot, _db$settings4, _db$online8;
+    if (sbUrl) sbUrl.value = ((_db$online6 = db.online) === null || _db$online6 === void 0 ? void 0 : _db$online6.url) || "";
+    if (sbKey) sbKey.value = ((_db$online7 = db.online) === null || _db$online7 === void 0 ? void 0 : _db$online7.key) || "";
+    if (autoSnapshotsToggle) autoSnapshotsToggle.checked = !!((_db$settings3 = db.settings) !== null && _db$settings3 !== void 0 && _db$settings3.autoSnapshots);
+    if (snapshotRetention) snapshotRetention.value = String((_db$settings$snapshot = (_db$settings4 = db.settings) === null || _db$settings4 === void 0 ? void 0 : _db$settings4.snapshotRetention) !== null && _db$settings$snapshot !== void 0 ? _db$settings$snapshot : 30);
+    setSbMsg((_db$online8 = db.online) !== null && _db$online8 !== void 0 && _db$online8.enabled ? "Supabase: ATIVO ✅" : "Supabase: desligado");
+    setSettingsMsg("");
+    setJsonMsg("");
+  }
+
+  if (btnSaveOnline) {
+    btnSaveOnline.onclick = () => {
+      try {
+        if (!canManage()) return alert("Sem permissão.");
+        const url = (sbUrl ? sbUrl.value : "").trim();
+        const key = (sbKey ? sbKey.value : "").trim();
+        if (!url || !key) return setSbMsg("URL e Key obrigatórios.");
+        db.online = { enabled: true, url, key };
+        saveDBTouch();
+        setSbMsg("Config Supabase guardada ✅");
+        logAction("online.enable", "settings", "", {});
+      } catch (e) {
+        setSbMsg("Erro: " + (e.message || e));
+      }
+    };
+  }
+
+  if (btnDisableOnline) {
+    btnDisableOnline.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+      db.online = { enabled: false, url: "", key: "" };
+      saveDBTouch();
+      renderSettings();
+      setSbMsg("Supabase desativado.");
+      logAction("online.disable", "settings", "", {});
+    };
+  }
+
+  if (btnBackupNow) {
+    btnBackupNow.onclick = async () => {
+      try {var _db$online9;
+        if (!canManage()) return alert("Sem permissão.");
+        if (!((_db$online9 = db.online) !== null && _db$online9 !== void 0 && _db$online9.enabled)) return setSbMsg("Ative Supabase primeiro.");
+        await pushSnapshot("manual_settings");
+        setSbMsg("Backup guardado ✅");
+      } catch (e) {
+        setSbMsg("Erro: " + (e.message || e));
+      }
+    };
+  }
+
+  if (btnSaveSettings) {
+    btnSaveSettings.onclick = () => {
+      if (!canManage()) return alert("Sem permissão.");
+      db.settings.autoSnapshots = !!(autoSnapshotsToggle && autoSnapshotsToggle.checked);
+      db.settings.snapshotRetention = Math.max(1, Math.floor(nnum(snapshotRetention ? snapshotRetention.value : "30", 30)));
+      saveDBTouch();
+      setSettingsMsg("Settings guardadas ✅");
+      logAction("settings.update", "settings", "", { autoSnapshots: db.settings.autoSnapshots, retention: db.settings.snapshotRetention });
+
+
+    };
+  }
+
+  function downloadJSON(filename, obj) {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  if (btnExportJSON) {
+    btnExportJSON.onclick = () => {
+      try {
+        if (!canManage()) return alert("Sem permissão.");
+        const ws = (workspaceId || "workspace").replace(/[^a-z0-9_-]/gi, "_");
+        downloadJSON(`gestao-facil_${ws}_${todayISO()}.json`, db);
+        setJsonMsg("Exportado ✅");
+        logAction("db.export_json", "db", "", {});
+      } catch (e) {
+        setJsonMsg("Erro ao exportar: " + (e.message || e));
+      }
+    };
+  }
+
+  async function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ""));
+      fr.onerror = reject;
+      fr.readAsText(file);
+    });
+  }
+
+  if (btnImportJSON) {
+    btnImportJSON.onclick = async () => {
+      try {
+        if (!canManage()) return alert("Sem permissão.");
+        if (!fileImportJSON || !fileImportJSON.files || !fileImportJSON.files[0]) {
+          return setJsonMsg("Escolha um ficheiro JSON.");
+        }
+        const txt = await readFileAsText(fileImportJSON.files[0]);
+        const incoming = JSON.parse(txt);
+        if (!incoming || typeof incoming !== "object") throw new Error("JSON inválido.");
+
+        if (!confirm("Importar vai substituir a base local deste dispositivo. Continuar?")) return;
+
+        save(DB_KEY, incoming);
+        db = load(DB_KEY, emptyDB());
+        db.inventory = db.inventory || [];
+        db.audit = db.audit || [];
+        db.settings = db.settings || { autoSnapshots: true, snapshotRetention: 30 };
+        db.online = db.online || { enabled: false, url: "", key: "" };
+        saveDBTouch();
+
+        setJsonMsg("Importado ✅");
+        logAction("db.import_json", "db", "", {});
+        refreshUsersDropdown();
+
+        renderPOS();
+        renderProducts();
+        renderClients();
+        renderAccounts();
+        renderLedger();
+        renderInventory();
+        renderSales();
+        renderAudit();
+        renderSettings();
+      } catch (e) {
+        setJsonMsg("Erro ao importar: " + (e.message || e));
+      }
+    };
+  }
+
+  /* =======================
+   Audit view (render + filtros)
+  ======================= */
+  function setAuditMsg(m) {if (auditMsg) auditMsg.textContent = m || "";}
+
+  function renderAudit() {
+    if (!db || !db.audit) return;
+    if (!auditTable) return;
+
+    const from = auditFrom ? auditFrom.value : "";
+    const to = auditTo ? auditTo.value : "";
+    const act = (auditAction ? auditAction.value : "").toLowerCase().trim();
+    const usr = (auditUser ? auditUser.value : "").toLowerCase().trim();
+
+    const rows = (db.audit || []).
+    filter(r => !from || (r.ts || "").slice(0, 10) >= from).
+    filter(r => !to || (r.ts || "").slice(0, 10) <= to).
+    filter(r => !act || String(r.action || "").toLowerCase().includes(act)).
+    filter(r => !usr || String(r.actorName || "").toLowerCase().includes(usr)).
+    sort((a, b) => String(b.ts || "").localeCompare(String(a.ts || "")));
+
+    auditTable.innerHTML = "";
+
+    rows.forEach(r => {
+      const row = document.createElement("div");
+      row.className = "rowitem ledger";
+      const metaStr = r.meta ? JSON.stringify(r.meta) : "";
+      row.innerHTML = `
+      <div>
+        <div><b>${(r.ts || "").slice(0, 19).replace("T", " ")}</b> <span class="badge">${r.role || "—"}</span></div>
+        <div class="muted">${r.actorName || r.actorId || "—"} • ${r.action || ""}</div>
+      </div>
+      <div class="mono">${r.entityType || "—"}</div>
+      <div class="muted">${r.entityId ? String(r.entityId).slice(0, 10) : "—"}</div>
+      <div class="muted">${metaStr ? metaStr.slice(0, 40) + (metaStr.length > 40 ? "…" : "") : "—"}</div>
+    `;
+      auditTable.appendChild(row);
+    });
+
+    if (auditCount) auditCount.textContent = `${rows.length} registo(s)`;
+    setAuditMsg(rows.length ? "" : "Sem registos com estes filtros.");
+  }
+
+  if (btnAuditRefresh) btnAuditRefresh.onclick = renderAudit;
+  if (btnAuditFilter) btnAuditFilter.onclick = renderAudit;
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {var _db$settings5, _db$online10;
+      if ((_db$settings5 = db.settings) !== null && _db$settings5 !== void 0 && _db$settings5.autoSnapshots && (_db$online10 = db.online) !== null && _db$online10 !== void 0 && _db$online10.enabled) {
+        autoSnapshot("visibility_exit");
+      }
     }
   });
 
-  const bd = document.getElementById("buyDate");
-  if (bd && !bd.value) bd.value = todayISO();
-  const sd = document.getElementById("saleDate");
-  if (sd && !sd.value) sd.value = todayISO();
 
-  await initSupabaseIfConfigured();
+  /* =======================
+     Boot
+  ======================= */
+  // ===== Dev/Test: expor relatorios no console (nao interfere no app)
+  window.GFReports = {
+    all: filters => rep_all(filters),
+    salesSummary: filters => rep_salesSummary(filters),
+    salesTimeseries: filters => rep_salesTimeseries(filters),
+    salesByProduct: filters => rep_salesByProduct(filters),
+    salesByClient: filters => rep_salesByClient(filters),
+    purchasesSummary: filters => rep_purchasesSummary(filters),
+    purchasesBySupplier: filters => rep_purchasesBySupplier(filters),
+    cashflow: filters => rep_cashflow(filters),
+    accountBalances: filters => rep_accountBalances(filters),
+    inventoryStatus: () => rep_inventoryStatus(),
+    inventoryMovements: filters => rep_inventoryMovements(filters),
+    audit: filters => rep_auditSummary(filters) };
 
-  try {
-    const mins = Math.max(5, Number(db.settings?.autoBackupMinutes || 10));
-    setInterval(() => saveAutoSnapshot(), mins * 60 * 1000);
-    window.addEventListener("beforeunload", () => saveAutoSnapshot());
-  } catch {}
 
-  renderAll();
-});
+  refreshUsersDropdown();
+  renderSettings();
+
+  // auto snapshot leve ao abrir (se online + auto)
+  if ((_db$online11 = db.online) !== null && _db$online11 !== void 0 && _db$online11.enabled && (_db$settings6 = db.settings) !== null && _db$settings6 !== void 0 && _db$settings6.autoSnapshots) {
+    debounce("dailySnap", 4000, async () => {
+      try {
+        if (!shouldRunDailySnapshot()) return;
+        await pushSnapshot("daily_open");
+        markDailySnapshotDone();
+      } catch (e) {
+        logAction("backup.fail", "", "", { error: String((e === null || e === void 0 ? void 0 : e.message) || e) });
+      }
+    });
+  }
+
+  console.log("GF: script carregou até ao fim ✅");
+  window.openView = openView;
+
+  if (session) {
+    showMain();
+    initNav();
+    openView("pos");
+  } else {
+    showAuth();
+  }
+})();
